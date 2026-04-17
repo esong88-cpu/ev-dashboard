@@ -99,9 +99,12 @@
             return `Station ${entry.device_id ?? "?"}`;
         }
 
+        const META_KEYS = new Set(["last_updated"]);
+
         function flattenPorts(stations) {
             const rows = [];
             for (const [id, entry] of Object.entries(stations || {})) {
+                if (META_KEYS.has(id)) continue;
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
@@ -196,19 +199,51 @@
         }
 
         let lastRows = [];
+        let lastPollerIso = null;
+
+        const STALE_MS = 10 * 60 * 1000;
+
+        function refreshLiveIndicator() {
+            if (lastPollerIso == null || lastPollerIso === "") {
+                liveDot.className = "w-2 h-2 rounded-full bg-amber-400 mr-2 animate-pulse";
+                liveLabel.textContent = "Last updated: — (waiting for poller)";
+                return;
+            }
+            const t = Date.parse(lastPollerIso);
+            if (Number.isNaN(t)) {
+                liveDot.className = "w-2 h-2 rounded-full bg-amber-500 mr-2";
+                liveLabel.textContent = "Last updated: invalid timestamp";
+                return;
+            }
+            const age = Date.now() - t;
+            const timeStr = new Date(t).toLocaleTimeString(undefined, {
+                hour: "numeric",
+                minute: "2-digit",
+            });
+            if (age > STALE_MS) {
+                liveDot.className = "w-2 h-2 rounded-full bg-red-600 mr-2";
+                liveLabel.textContent = "Status: Offline (Poller failed)";
+            } else {
+                liveDot.className = "w-2 h-2 rounded-full bg-emerald-500 mr-2";
+                liveLabel.textContent = `Last updated: ${timeStr}`;
+            }
+        }
 
         onValue(
             stationsRef,
             (snap) => {
-                liveDot.className = "w-2 h-2 rounded-full bg-emerald-500 mr-2";
-                liveLabel.textContent = "live";
                 const data = snap.val();
                 if (!data) {
+                    lastPollerIso = null;
                     lastRows = [];
+                    refreshLiveIndicator();
                     gridEl.innerHTML = `<div class="p-4 col-span-full text-sm text-gray-400">No data at /stations</div>`;
                     wallEl.innerHTML = `<div class="text-sm text-gray-400 py-3 border-b border-gray-100">No offenders yet.</div>`;
                     return;
                 }
+                lastPollerIso =
+                    typeof data.last_updated === "string" ? data.last_updated : null;
+                refreshLiveIndicator();
                 lastRows = flattenPorts(data);
                 updateCompleteTracking(lastRows);
                 renderGrid(lastRows);
@@ -222,6 +257,7 @@
         );
 
         setInterval(() => {
+            refreshLiveIndicator();
             if (lastRows.length === 0) return;
             renderWall(lastRows);
             document.querySelectorAll(".shame-row").forEach((el) => {

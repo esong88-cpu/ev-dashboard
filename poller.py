@@ -261,9 +261,15 @@ def main() -> None:
 
     ref = db.reference("/stations")
     payload = poll_once(client, station_ids, home_ids)
+    last_updated = datetime.now(timezone.utc).isoformat()
+    root_payload: Dict[str, Any] = {"last_updated": last_updated, **payload}
     logger.info("Writing %d station(s) to Firebase…", len(payload))
-    ref.set(payload)
-    logger.info("Updated /stations: %s", json.dumps(payload, default=str)[:500])
+    ref.set(root_payload)
+    logger.info(
+        "Updated /stations (last_updated=%s): %s",
+        last_updated,
+        json.dumps(payload, default=str)[:500],
+    )
     logger.info("Done.")
 
 
