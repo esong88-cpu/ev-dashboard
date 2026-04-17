@@ -1,3 +1,4 @@
-python-chargepoint>=1.10.0
+# v2+ is async-only with different imports; this project uses the 1.x sync API.
+python-chargepoint==1.10.0
 firebase-admin>=6.0.0
 requests>=2.28.0
