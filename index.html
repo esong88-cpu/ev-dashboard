@@ -1,0 +1,237 @@
+ <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EV Charger Status</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Courier New', Courier, monospace; color: #4a5568; }
+        .grid-item { border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; }
+        .grid-container { border-left: 1px solid #e2e8f0; border-top: 1px solid #e2e8f0; }
+    </style>
+</head>
+<body class="p-8 max-w-3xl mx-auto tracking-wide">
+
+    <h1 class="text-xl tracking-widest text-gray-700 uppercase mb-2">Samtec EV Chargers</h1>
+    <div class="flex items-center text-sm text-gray-500 mb-8">
+        <span id="live-dot" class="w-2 h-2 rounded-full bg-emerald-500 mr-2"></span>
+        <span id="live-label">connecting…</span>
+    </div>
+
+    <div class="border-b border-gray-200 mb-8"></div>
+
+    <h2 class="text-sm font-semibold tracking-widest text-gray-500 uppercase mb-6">Wall of Shame</h2>
+    <p class="text-xs text-gray-400 mb-4">Complete but still plugged in — time is tracked from when this page first saw the port as Complete (refresh clears timers).</p>
+    <div id="wall-of-shame" class="flex flex-col mb-12 min-h-[4rem]">
+        <div class="text-sm text-gray-400 py-3 border-b border-gray-100">No offenders yet.</div>
+    </div>
+
+    <div class="flex justify-between items-end mb-6">
+        <h2 class="text-sm font-semibold tracking-widest text-gray-500 uppercase">All Chargers</h2>
+        <span class="text-xs text-gray-400">by status</span>
+    </div>
+
+    <div id="chargers-grid" class="grid grid-cols-2 md:grid-cols-4 grid-container bg-white min-h-[8rem]">
+        <div class="p-4 col-span-full text-sm text-gray-400">Loading…</div>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+        import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+
+        // --- Paste your web app config from Firebase Console → Project settings → Your apps ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyCMLfdk0kPpl3g_BjVkuUOLlivS25jZAQw",
+            authDomain: "samtec-chargers.firebaseapp.com",
+            databaseURL: "https://samtec-chargers-default-rtdb.firebaseio.com",
+            projectId: "samtec-chargers",
+            storageBucket: "samtec-chargers.firebasestorage.app",
+            messagingSenderId: "815704178070",
+            appId: "1:815704178070:web:208c3d76006fc1b0edf1b7",
+            measurementId: "G-050F1LV7GQ"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getDatabase(app);
+        const stationsRef = ref(db, "/stations");
+
+        const liveDot = document.getElementById("live-dot");
+        const liveLabel = document.getElementById("live-label");
+        const wallEl = document.getElementById("wall-of-shame");
+        const gridEl = document.getElementById("chargers-grid");
+
+        /** ms → first time we saw this key as Complete (client-side; survives until status changes) */
+        const completeSince = new Map();
+
+        function normStatus(s) {
+            return String(s || "").trim().toLowerCase();
+        }
+
+        function statusBucket(raw) {
+            const s = normStatus(raw);
+            if (s === "available") return "available";
+            if (s === "charging") return "charging";
+            if (s === "complete") return "complete";
+            return "other";
+        }
+
+        function statusClasses(bucket) {
+            if (bucket === "available") return "text-emerald-500";
+            if (bucket === "charging") return "text-blue-500";
+            if (bucket === "complete") return "text-red-600";
+            return "text-gray-500";
+        }
+
+        function formatDuration(ms) {
+            if (ms < 0 || !Number.isFinite(ms)) return "—";
+            const m = Math.floor(ms / 60000);
+            const h = Math.floor(m / 60);
+            const rem = m % 60;
+            if (h > 0) return `${h}h ${rem}m`;
+            return `${m}m`;
+        }
+
+        function stationTitle(entry) {
+            const n = entry.name;
+            if (Array.isArray(n)) return n.filter(Boolean).join(" ").trim();
+            if (typeof n === "string") return n;
+            return `Station ${entry.device_id ?? "?"}`;
+        }
+
+        function flattenPorts(stations) {
+            const rows = [];
+            for (const [id, entry] of Object.entries(stations || {})) {
+                if (!entry || typeof entry !== "object") continue;
+                if (entry.error) continue;
+                const title = stationTitle(entry);
+                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
+                if (keys.length === 0) {
+                    rows.push({
+                        key: `${id}-0`,
+                        deviceId: id,
+                        portLabel: "",
+                        title,
+                        status: entry.station_status || "unknown",
+                        sort: statusBucket(entry.station_status)
+                    });
+                } else {
+                    for (const pk of keys) {
+                        rows.push({
+                            key: `${id}-${pk}`,
+                            deviceId: id,
+                            portLabel: `Port ${pk}`,
+                            title,
+                            status: ports[pk],
+                            sort: statusBucket(ports[pk])
+                        });
+                    }
+                }
+            }
+            const order = { available: 0, charging: 1, complete: 2, other: 3 };
+            rows.sort((a, b) => (order[a.sort] ?? 9) - (order[b.sort] ?? 9) || a.title.localeCompare(b.title));
+            return rows;
+        }
+
+        function updateCompleteTracking(rows) {
+            const seen = new Set();
+            for (const r of rows) {
+                const bucket = statusBucket(r.status);
+                if (bucket !== "complete") {
+                    completeSince.delete(r.key);
+                    continue;
+                }
+                seen.add(r.key);
+                if (!completeSince.has(r.key)) {
+                    completeSince.set(r.key, Date.now());
+                }
+            }
+            for (const k of [...completeSince.keys()]) {
+                if (!seen.has(k)) completeSince.delete(k);
+            }
+        }
+
+        function renderWall(rows) {
+            const shame = rows.filter((r) => statusBucket(r.status) === "complete");
+            if (shame.length === 0) {
+                wallEl.innerHTML = `<div class="text-sm text-gray-400 py-3 border-b border-gray-100">No offenders yet.</div>`;
+                return;
+            }
+            wallEl.innerHTML = shame
+                .map((r) => {
+                    const started = completeSince.get(r.key) ?? Date.now();
+                    const over = formatDuration(Date.now() - started);
+                    const label = r.portLabel ? `${r.title} (${r.portLabel})` : r.title;
+                    return `
+                <div class="flex justify-between py-3 border-b border-gray-100 shame-row" data-key="${r.key}">
+                    <span class="text-gray-800">${label}</span>
+                    <span class="text-red-600 font-bold shame-duration">${over} idle</span>
+                </div>`;
+                })
+                .join("");
+        }
+
+        function renderGrid(rows) {
+            if (rows.length === 0) {
+                gridEl.innerHTML = `<div class="p-4 col-span-full text-sm text-gray-400">No station data.</div>`;
+                return;
+            }
+            gridEl.innerHTML = rows
+                .map((r, i) => {
+                    const bucket = statusBucket(r.status);
+                    const cls = statusClasses(bucket);
+                    const bg = i % 2 === 1 ? "bg-gray-50" : "";
+                    const sub = r.portLabel
+                        ? `<div class="text-xs text-gray-500 mb-1">${r.portLabel}</div>`
+                        : "";
+                    return `
+                <div class="p-4 grid-item ${bg}">
+                    <div class="text-sm text-gray-800 mb-1">${r.title}</div>
+                    ${sub}
+                    <div class="text-sm ${cls}">${normStatus(r.status) || "unknown"}</div>
+                </div>`;
+                })
+                .join("");
+        }
+
+        let lastRows = [];
+
+        onValue(
+            stationsRef,
+            (snap) => {
+                liveDot.className = "w-2 h-2 rounded-full bg-emerald-500 mr-2";
+                liveLabel.textContent = "live";
+                const data = snap.val();
+                if (!data) {
+                    lastRows = [];
+                    gridEl.innerHTML = `<div class="p-4 col-span-full text-sm text-gray-400">No data at /stations</div>`;
+                    wallEl.innerHTML = `<div class="text-sm text-gray-400 py-3 border-b border-gray-100">No offenders yet.</div>`;
+                    return;
+                }
+                lastRows = flattenPorts(data);
+                updateCompleteTracking(lastRows);
+                renderGrid(lastRows);
+                renderWall(lastRows);
+            },
+            (err) => {
+                console.error(err);
+                liveDot.className = "w-2 h-2 rounded-full bg-amber-500 mr-2";
+                liveLabel.textContent = "error";
+            }
+        );
+
+        setInterval(() => {
+            if (lastRows.length === 0) return;
+            renderWall(lastRows);
+            document.querySelectorAll(".shame-row").forEach((el) => {
+                const key = el.getAttribute("data-key");
+                const dur = el.querySelector(".shame-duration");
+                if (!dur || !key) return;
+                const started = completeSince.get(key);
+                if (started) dur.textContent = `${formatDuration(Date.now() - started)} idle`;
+            });
+        }, 1000);
+    </script>
+</body>
+</html>
