@@ -295,7 +295,9 @@
 
         let lastRowsSorted = [];
         let lastPollerIso = null;
-        const STALE_MS = 10 * 60 * 1000;
+        /** Green: data this fresh. Orange: between fresh and offline. Red: older than offline. */
+        const FRESH_MS = 5 * 60 * 1000;
+        const OFFLINE_MS = 10 * 60 * 1000;
 
         function parseLastUpdated(raw) {
             if (raw == null || raw === "") return NaN;
@@ -309,25 +311,41 @@
             return NaN;
         }
 
+        /** Human-readable age since last poll (e.g. "3 minutes ago"). */
+        function formatPollAge(ageMs) {
+            const minutes = Math.floor(ageMs / 60000);
+            if (minutes < 1) return "just now";
+            if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+            const hours = Math.floor(minutes / 60);
+            if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+            const days = Math.floor(hours / 24);
+            return `${days} day${days === 1 ? "" : "s"} ago`;
+        }
+
         function refreshLiveIndicator() {
             const t = parseLastUpdated(lastPollerIso);
             if (Number.isNaN(t)) {
                 liveDot.className = "w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0 animate-pulse";
                 liveLabel.textContent =
-                    "No poller heartbeat yet — run poller.py once or wait for GitHub Actions";
+                    "No poll time yet — run the poller or check GitHub Actions";
                 return;
             }
             const age = Date.now() - t;
-            const timeStr = new Date(t).toLocaleTimeString(undefined, {
+            const clockStr = new Date(t).toLocaleTimeString(undefined, {
                 hour: "numeric",
                 minute: "2-digit",
             });
-            if (age > STALE_MS) {
-                liveDot.className = "w-2.5 h-2.5 rounded-full bg-red-600 shrink-0";
-                liveLabel.textContent = "Status: Offline (Poller failed)";
-            } else {
+            const relative = formatPollAge(age);
+            const detail = `last polled ${relative} (${clockStr})`;
+            if (age <= FRESH_MS) {
+                liveDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0";
+                liveLabel.textContent = `Online · ${detail}`;
+            } else if (age <= OFFLINE_MS) {
                 liveDot.className = "w-2.5 h-2.5 rounded-full bg-samtec-orange shrink-0";
-                liveLabel.textContent = `Last updated: ${timeStr}`;
+                liveLabel.textContent = `Delayed · ${detail}`;
+            } else {
+                liveDot.className = "w-2.5 h-2.5 rounded-full bg-red-600 shrink-0";
+                liveLabel.textContent = `Offline · ${detail}`;
             }
         }
 
