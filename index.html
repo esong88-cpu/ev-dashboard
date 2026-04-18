@@ -1,46 +1,80 @@
- <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EV Charger Status</title>
+    <title>Samtec EV Chargers</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        samtec: {
+                            orange: "#ea580c",
+                            dark: "#0a0a0a",
+                            asphalt: "#1c1917",
+                            line: "#44403c",
+                        },
+                    },
+                    fontFamily: {
+                        mono: ["'JetBrains Mono'", "ui-monospace", "Courier New", "monospace"],
+                    },
+                },
+            },
+        };
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Courier New', Courier, monospace; color: #4a5568; }
-        .grid-item { border-right: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; }
-        .grid-container { border-left: 1px solid #e2e8f0; border-top: 1px solid #e2e8f0; }
+        body { font-family: "JetBrains Mono", ui-monospace, monospace; }
+        @keyframes charge-pulse {
+            0%, 100% { filter: drop-shadow(0 0 6px rgba(234, 88, 12, 0.9)); opacity: 1; }
+            50% { filter: drop-shadow(0 0 14px rgba(251, 146, 60, 1)); opacity: 0.95; }
+        }
+        .car-charging { animation: charge-pulse 2s ease-in-out infinite; }
+        .stall-lines {
+            background-image: repeating-linear-gradient(
+                90deg,
+                transparent,
+                transparent 8px,
+                rgba(68, 64, 60, 0.5) 8px,
+                rgba(68, 64, 60, 0.5) 10px
+            );
+        }
     </style>
 </head>
-<body class="p-8 max-w-3xl mx-auto tracking-wide">
+<body class="min-h-screen bg-samtec-dark text-stone-300 font-mono antialiased">
+    <div class="max-w-5xl mx-auto px-4 py-6 sm:px-6 sm:py-10">
+        <header class="border-b-2 border-samtec-orange pb-6 mb-8">
+            <h1 class="text-xl sm:text-2xl font-bold tracking-[0.2em] text-samtec-orange uppercase">Samtec EV Chargers</h1>
+            <div class="flex items-center gap-2 mt-3 text-sm text-stone-400">
+                <span id="live-dot" class="w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0"></span>
+                <span id="live-label">connecting…</span>
+            </div>
+        </header>
 
-    <h1 class="text-xl tracking-widest text-gray-700 uppercase mb-2">Samtec EV Chargers</h1>
-    <div class="flex items-center text-sm text-gray-500 mb-8">
-        <span id="live-dot" class="w-2 h-2 rounded-full bg-emerald-500 mr-2"></span>
-        <span id="live-label">connecting…</span>
-    </div>
+        <section aria-label="Parking lot" class="mb-10">
+            <h2 class="text-xs font-semibold tracking-[0.25em] text-samtec-orange uppercase mb-4">Lot</h2>
+            <div id="parking-lot" class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 min-h-[12rem]">
+                <div class="col-span-full text-sm text-stone-500 py-8 text-center border border-dashed border-stone-600 rounded-lg">Loading…</div>
+            </div>
+        </section>
 
-    <div class="border-b border-gray-200 mb-8"></div>
-
-    <h2 class="text-sm font-semibold tracking-widest text-gray-500 uppercase mb-6">Wall of Shame</h2>
-    <p class="text-xs text-gray-400 mb-4">Complete but still plugged in — time is tracked from when this page first saw the port as Complete (refresh clears timers).</p>
-    <div id="wall-of-shame" class="flex flex-col mb-12 min-h-[4rem]">
-        <div class="text-sm text-gray-400 py-3 border-b border-gray-100">No offenders yet.</div>
-    </div>
-
-    <div class="flex justify-between items-end mb-6">
-        <h2 class="text-sm font-semibold tracking-widest text-gray-500 uppercase">All Chargers</h2>
-        <span class="text-xs text-gray-400">by status</span>
-    </div>
-
-    <div id="chargers-grid" class="grid grid-cols-2 md:grid-cols-4 grid-container bg-white min-h-[8rem]">
-        <div class="p-4 col-span-full text-sm text-gray-400">Loading…</div>
+        <section class="mb-10">
+            <h2 class="text-xs font-semibold tracking-[0.25em] text-stone-500 uppercase mb-2">Complete — still connected</h2>
+            <p class="text-xs text-stone-500 mb-4">Ports reporting <span class="text-orange-400">complete</span> (session finished; cable may still be plugged in). Timers start when this page first sees “complete” (refresh resets them).</p>
+            <div id="complete-list" class="flex flex-col border border-stone-700 rounded-lg overflow-hidden bg-samtec-asphalt/50 min-h-[4rem]">
+                <div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>
+            </div>
+        </section>
     </div>
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
         import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
-        // --- Paste your web app config from Firebase Console → Project settings → Your apps ---
         const firebaseConfig = {
             apiKey: "AIzaSyCMLfdk0kPpl3g_BjVkuUOLlivS25jZAQw",
             authDomain: "samtec-chargers.firebaseapp.com",
@@ -58,11 +92,11 @@
 
         const liveDot = document.getElementById("live-dot");
         const liveLabel = document.getElementById("live-label");
-        const wallEl = document.getElementById("wall-of-shame");
-        const gridEl = document.getElementById("chargers-grid");
+        const completeListEl = document.getElementById("complete-list");
+        const parkingLotEl = document.getElementById("parking-lot");
 
-        /** ms → first time we saw this key as Complete (client-side; survives until status changes) */
         const completeSince = new Map();
+        const STALL_COUNT = 4;
 
         function normStatus(s) {
             return String(s || "").trim().toLowerCase();
@@ -74,13 +108,6 @@
             if (s === "charging") return "charging";
             if (s === "complete") return "complete";
             return "other";
-        }
-
-        function statusClasses(bucket) {
-            if (bucket === "available") return "text-emerald-500";
-            if (bucket === "charging") return "text-blue-500";
-            if (bucket === "complete") return "text-red-600";
-            return "text-gray-500";
         }
 
         function formatDuration(ms) {
@@ -101,7 +128,8 @@
 
         const META_KEYS = new Set(["last_updated"]);
 
-        function flattenPorts(stations) {
+        /** Rows in stable order (device id, port) — no status sort (for fixed parking stalls). */
+        function flattenPortsStable(stations) {
             const rows = [];
             for (const [id, entry] of Object.entries(stations || {})) {
                 if (META_KEYS.has(id)) continue;
@@ -117,7 +145,7 @@
                         portLabel: "",
                         title,
                         status: entry.station_status || "unknown",
-                        sort: statusBucket(entry.station_status)
+                        sort: statusBucket(entry.station_status),
                     });
                 } else {
                     for (const pk of keys) {
@@ -127,14 +155,106 @@
                             portLabel: `Port ${pk}`,
                             title,
                             status: ports[pk],
-                            sort: statusBucket(ports[pk])
+                            sort: statusBucket(ports[pk]),
                         });
                     }
                 }
             }
-            const order = { available: 0, charging: 1, complete: 2, other: 3 };
-            rows.sort((a, b) => (order[a.sort] ?? 9) - (order[b.sort] ?? 9) || a.title.localeCompare(b.title));
+            rows.sort((a, b) => {
+                const da = parseInt(String(a.deviceId), 10) || 0;
+                const db = parseInt(String(b.deviceId), 10) || 0;
+                if (da !== db) return da - db;
+                const pa = String(a.portLabel).replace(/\D/g, "") || "0";
+                const pb = String(b.portLabel).replace(/\D/g, "") || "0";
+                return parseInt(pa, 10) - parseInt(pb, 10);
+            });
             return rows;
+        }
+
+        function flattenPortsSortedByStatus(stations) {
+            const rows = flattenPortsStable(stations);
+            const order = { available: 0, charging: 1, complete: 2, other: 3 };
+            rows.sort(
+                (a, b) =>
+                    (order[a.sort] ?? 9) - (order[b.sort] ?? 9) || a.title.localeCompare(b.title)
+            );
+            return rows;
+        }
+
+        function stallSlotsFromRows(rows) {
+            const slots = [];
+            for (let i = 0; i < STALL_COUNT; i++) slots.push(rows[i] ?? null);
+            return slots;
+        }
+
+        function carVariantForKey(key) {
+            let h = 0;
+            for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+            return h % 3;
+        }
+
+        /** Simple side-view cars in Samtec orange (SVG). */
+        function carSvg(variant) {
+            const bodies = [
+                "M8 38h104c4 0 8-3 8-8V22c0-6-5-11-11-11H25l-8-6H8v33z M28 18h72v12H28z",
+                "M6 36h108l6-4c3-2 5-5 5-9V20c0-7-6-12-13-12H22l-6-5H6v33z M30 16h68v14H30z",
+                "M10 37h100c5 0 10-4 10-10v-8c0-6-5-10-11-10H26l-7-5h-9v33z M32 17h64v13H32z",
+            ];
+            const wheels = "M22 44h10v6H22zm66 0h10v6H88z";
+            const v = bodies[variant] || bodies[0];
+            return `<svg viewBox="0 0 120 52" class="w-full h-auto max-h-[7rem] mx-auto car-charging" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path fill="#ea580c" d="${v}"/>
+                <path fill="#0a0a0a" d="${wheels}"/>
+                <path fill="#292524" opacity="0.35" d="M38 20h44v8H38z"/>
+            </svg>`;
+        }
+
+        function stallStatusLabel(bucket) {
+            if (bucket === "available") return { text: "Open", class: "text-stone-500" };
+            if (bucket === "charging") return { text: "Charging", class: "text-samtec-orange font-semibold" };
+            if (bucket === "complete") return { text: "Complete", class: "text-orange-300" };
+            return { text: "Unknown", class: "text-stone-500" };
+        }
+
+        function renderParkingLot(slots) {
+            if (slots.every((s) => s === null)) {
+                parkingLotEl.innerHTML = `<div class="col-span-full text-sm text-stone-500 py-8 text-center border border-dashed border-stone-600 rounded-lg">No station data.</div>`;
+                return;
+            }
+            parkingLotEl.innerHTML = slots
+                .map((r, idx) => {
+                    const n = idx + 1;
+                    if (!r) {
+                        return `
+                    <div class="rounded-lg border-2 border-dashed border-stone-700 bg-samtec-asphalt p-3 flex flex-col min-h-[11rem] stall-lines">
+                        <div class="text-[10px] tracking-widest text-stone-600 uppercase mb-1">Spot ${n}</div>
+                        <div class="flex-1 flex items-center justify-center text-stone-600 text-xs">—</div>
+                    </div>`;
+                    }
+                    const bucket = statusBucket(r.status);
+                    const label = r.portLabel ? `${r.title} · ${r.portLabel}` : r.title;
+                    const { text: stText, class: stClass } = stallStatusLabel(bucket);
+                    const showCar = bucket === "charging";
+                    const variant = carVariantForKey(r.key);
+                    const idleHint =
+                        bucket === "available"
+                            ? "No vehicle"
+                            : bucket === "complete"
+                              ? "Session complete"
+                              : "";
+                    const carHtml = showCar
+                        ? carSvg(variant)
+                        : `<div class="flex-1 flex items-center justify-center text-stone-600 text-[11px] px-1 text-center">${idleHint}</div>`;
+
+                    return `
+                <div class="rounded-lg border-2 ${showCar ? "border-samtec-orange shadow-[0_0_20px_rgba(234,88,12,0.25)]" : "border-stone-700"} bg-samtec-asphalt p-3 flex flex-col min-h-[11rem]">
+                    <div class="text-[10px] tracking-widest text-stone-500 uppercase mb-1 truncate" title="${label}">Spot ${n}</div>
+                    <div class="text-xs text-stone-400 mb-2 line-clamp-2 min-h-[2rem]">${label}</div>
+                    <div class="flex-1 flex flex-col justify-center stall-lines rounded min-h-[5.5rem] px-1">${carHtml}</div>
+                    <div class="mt-2 text-center text-xs ${stClass}">${stText}</div>
+                </div>`;
+                })
+                .join("");
         }
 
         function updateCompleteTracking(rows) {
@@ -146,64 +266,37 @@
                     continue;
                 }
                 seen.add(r.key);
-                if (!completeSince.has(r.key)) {
-                    completeSince.set(r.key, Date.now());
-                }
+                if (!completeSince.has(r.key)) completeSince.set(r.key, Date.now());
             }
             for (const k of [...completeSince.keys()]) {
                 if (!seen.has(k)) completeSince.delete(k);
             }
         }
 
-        function renderWall(rows) {
-            const shame = rows.filter((r) => statusBucket(r.status) === "complete");
-            if (shame.length === 0) {
-                wallEl.innerHTML = `<div class="text-sm text-gray-400 py-3 border-b border-gray-100">No offenders yet.</div>`;
+        function renderCompleteList(rows) {
+            const completeRows = rows.filter((r) => statusBucket(r.status) === "complete");
+            if (completeRows.length === 0) {
+                completeListEl.innerHTML = `<div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>`;
                 return;
             }
-            wallEl.innerHTML = shame
+            completeListEl.innerHTML = completeRows
                 .map((r) => {
                     const started = completeSince.get(r.key) ?? Date.now();
                     const over = formatDuration(Date.now() - started);
                     const label = r.portLabel ? `${r.title} (${r.portLabel})` : r.title;
                     return `
-                <div class="flex justify-between py-3 border-b border-gray-100 shame-row" data-key="${r.key}">
-                    <span class="text-gray-800">${label}</span>
-                    <span class="text-red-600 font-bold shame-duration">${over} idle</span>
+                <div class="flex justify-between gap-3 px-4 py-3 border-b border-stone-800 last:border-0 complete-row bg-black/20" data-key="${r.key}">
+                    <span class="text-stone-300 text-sm">${label}</span>
+                    <span class="text-orange-400 font-semibold text-sm shrink-0 complete-duration">Complete · ${over}</span>
                 </div>`;
                 })
                 .join("");
         }
 
-        function renderGrid(rows) {
-            if (rows.length === 0) {
-                gridEl.innerHTML = `<div class="p-4 col-span-full text-sm text-gray-400">No station data.</div>`;
-                return;
-            }
-            gridEl.innerHTML = rows
-                .map((r, i) => {
-                    const bucket = statusBucket(r.status);
-                    const cls = statusClasses(bucket);
-                    const bg = i % 2 === 1 ? "bg-gray-50" : "";
-                    const sub = r.portLabel
-                        ? `<div class="text-xs text-gray-500 mb-1">${r.portLabel}</div>`
-                        : "";
-                    return `
-                <div class="p-4 grid-item ${bg}">
-                    <div class="text-sm text-gray-800 mb-1">${r.title}</div>
-                    ${sub}
-                    <div class="text-sm ${cls}">${normStatus(r.status) || "unknown"}</div>
-                </div>`;
-                })
-                .join("");
-        }
-
-        let lastRows = [];
+        let lastRowsSorted = [];
         let lastPollerIso = null;
-
         const STALE_MS = 10 * 60 * 1000;
 
-        /** Normalize Firebase last_updated (ISO string or epoch ms/s) to epoch ms. */
         function parseLastUpdated(raw) {
             if (raw == null || raw === "") return NaN;
             if (typeof raw === "number" && Number.isFinite(raw)) {
@@ -219,7 +312,7 @@
         function refreshLiveIndicator() {
             const t = parseLastUpdated(lastPollerIso);
             if (Number.isNaN(t)) {
-                liveDot.className = "w-2 h-2 rounded-full bg-amber-400 mr-2 animate-pulse";
+                liveDot.className = "w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0 animate-pulse";
                 liveLabel.textContent =
                     "No poller heartbeat yet — run poller.py once or wait for GitHub Actions";
                 return;
@@ -228,12 +321,12 @@
             const timeStr = new Date(t).toLocaleTimeString(undefined, {
                 hour: "numeric",
                 minute: "2-digit",
-            }); // e.g. 10:14 PM
+            });
             if (age > STALE_MS) {
-                liveDot.className = "w-2 h-2 rounded-full bg-red-600 mr-2";
+                liveDot.className = "w-2.5 h-2.5 rounded-full bg-red-600 shrink-0";
                 liveLabel.textContent = "Status: Offline (Poller failed)";
             } else {
-                liveDot.className = "w-2 h-2 rounded-full bg-emerald-500 mr-2";
+                liveDot.className = "w-2.5 h-2.5 rounded-full bg-samtec-orange shrink-0";
                 liveLabel.textContent = `Last updated: ${timeStr}`;
             }
         }
@@ -244,36 +337,40 @@
                 const data = snap.val();
                 if (!data) {
                     lastPollerIso = null;
-                    lastRows = [];
+                    lastRowsSorted = [];
                     refreshLiveIndicator();
-                    gridEl.innerHTML = `<div class="p-4 col-span-full text-sm text-gray-400">No data at /stations</div>`;
-                    wallEl.innerHTML = `<div class="text-sm text-gray-400 py-3 border-b border-gray-100">No offenders yet.</div>`;
+                    parkingLotEl.innerHTML = `<div class="col-span-full text-sm text-stone-500 py-8 text-center border border-dashed border-stone-600 rounded-lg">No data at /stations</div>`;
+                    completeListEl.innerHTML = `<div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>`;
                     return;
                 }
                 lastPollerIso = data.last_updated ?? null;
                 refreshLiveIndicator();
-                lastRows = flattenPorts(data);
-                updateCompleteTracking(lastRows);
-                renderGrid(lastRows);
-                renderWall(lastRows);
+
+                const stable = flattenPortsStable(data);
+                const slots = stallSlotsFromRows(stable);
+                renderParkingLot(slots);
+
+                lastRowsSorted = flattenPortsSortedByStatus(data);
+                updateCompleteTracking(lastRowsSorted);
+                renderCompleteList(lastRowsSorted);
             },
             (err) => {
                 console.error(err);
-                liveDot.className = "w-2 h-2 rounded-full bg-amber-500 mr-2";
+                liveDot.className = "w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0";
                 liveLabel.textContent = "error";
             }
         );
 
         setInterval(() => {
             refreshLiveIndicator();
-            if (lastRows.length === 0) return;
-            renderWall(lastRows);
-            document.querySelectorAll(".shame-row").forEach((el) => {
+            if (lastRowsSorted.length === 0) return;
+            renderCompleteList(lastRowsSorted);
+            document.querySelectorAll(".complete-row").forEach((el) => {
                 const key = el.getAttribute("data-key");
-                const dur = el.querySelector(".shame-duration");
+                const dur = el.querySelector(".complete-duration");
                 if (!dur || !key) return;
                 const started = completeSince.get(key);
-                if (started) dur.textContent = `${formatDuration(Date.now() - started)} idle`;
+                if (started) dur.textContent = `Complete · ${formatDuration(Date.now() - started)}`;
             });
         }, 1000);
     </script>
