@@ -21,6 +21,7 @@ jobs:
 
       - name: Run poller once
         env:
+          # Optional: CHARGING_LIMIT_MINUTES (default 120) — add here or in repo env if you change the co-op window.
           CHARGEPOINT_USER: ${{ secrets.CHARGEPOINT_USER }}
           CHARGEPOINT_PASS: ${{ secrets.CHARGEPOINT_PASS }}
           CHARGEPOINT_SESSION_TOKEN: ${{ secrets.CHARGEPOINT_SESSION_TOKEN }}

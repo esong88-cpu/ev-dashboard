@@ -63,17 +63,33 @@
         </section>
 
         <section class="mb-10">
-            <h2 class="text-xs font-semibold tracking-[0.25em] text-stone-500 uppercase mb-2">Complete — still connected</h2>
-            <p class="text-xs text-stone-500 mb-4">Ports reporting <span class="text-orange-400">complete</span> (session finished; cable may still be plugged in). Timers start when this page first sees “complete” (refresh resets them).</p>
+            <h2 class="text-xs font-semibold tracking-[0.25em] text-stone-500 uppercase mb-2">Complete — move the car</h2>
+            <p class="text-xs text-stone-500 mb-4">A spot is <span class="text-orange-400">complete</span> when the <span class="text-stone-400">co-op timer</span> ends (default 2 hours from when the poller first saw the port occupied). ChargePoint can report “session complete” earlier while the car still counts as charging here. <span class="text-stone-400">“Complete · Xm”</span> uses the time stored in Firebase when the poller first saw the deadline pass (reload-safe). If that field is missing (old data / poller not updated yet), the page falls back to when this tab first saw complete.</p>
             <div id="complete-list" class="flex flex-col border border-stone-700 rounded-lg overflow-hidden bg-samtec-asphalt/50 min-h-[4rem]">
                 <div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>
             </div>
         </section>
     </div>
 
+    <!-- Extend charging window -->
+    <div id="extend-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" aria-hidden="true">
+        <div class="w-full max-w-sm rounded-lg border border-stone-600 bg-stone-900 p-5 shadow-xl">
+            <h3 class="text-sm font-semibold text-samtec-orange uppercase tracking-widest mb-3">Extend window</h3>
+            <p class="text-xs text-stone-500 mb-4">Adds time from now or from your current deadline, whichever is later. Others will see who extended.</p>
+            <label class="block text-xs text-stone-400 mb-1">Your name</label>
+            <input id="extend-name" type="text" maxlength="80" class="w-full mb-3 px-3 py-2 rounded bg-black border border-stone-600 text-stone-200 text-sm" placeholder="e.g. Jordan" />
+            <label class="block text-xs text-stone-400 mb-1">Extra minutes</label>
+            <input id="extend-minutes" type="number" min="15" max="480" value="120" class="w-full mb-4 px-3 py-2 rounded bg-black border border-stone-600 text-stone-200 text-sm" />
+            <div class="flex justify-end gap-2">
+                <button type="button" id="extend-cancel" class="px-3 py-1.5 text-xs rounded border border-stone-600 text-stone-400 hover:bg-stone-800">Cancel</button>
+                <button type="button" id="extend-save" class="px-3 py-1.5 text-xs rounded bg-samtec-orange text-black font-semibold hover:opacity-90">Save</button>
+            </div>
+        </div>
+    </div>
+
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-        import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+        import { getDatabase, ref, onValue, set } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyCMLfdk0kPpl3g_BjVkuUOLlivS25jZAQw",
@@ -89,14 +105,24 @@
         const app = initializeApp(firebaseConfig);
         const db = getDatabase(app);
         const stationsRef = ref(db, "/stations");
+        const extensionsRef = ref(db, "/slot_extensions");
 
         const liveDot = document.getElementById("live-dot");
         const liveLabel = document.getElementById("live-label");
         const completeListEl = document.getElementById("complete-list");
         const parkingLotEl = document.getElementById("parking-lot");
+        const extendModal = document.getElementById("extend-modal");
+        const extendNameInput = document.getElementById("extend-name");
+        const extendMinutesInput = document.getElementById("extend-minutes");
+        const extendSaveBtn = document.getElementById("extend-save");
+        const extendCancelBtn = document.getElementById("extend-cancel");
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+
+        let lastStationPayload = null;
+        let lastExtMap = {};
+        let pendingExtendKey = null;
 
         function normStatus(s) {
             return String(s || "").trim().toLowerCase();
@@ -126,7 +152,7 @@
             return `Station ${entry.device_id ?? "?"}`;
         }
 
-        const META_KEYS = new Set(["last_updated"]);
+        const META_KEYS = new Set(["last_updated", "charging_limit_minutes"]);
 
         /** Rows in stable order (device id, port) — no status sort (for fixed parking stalls). */
         function flattenPortsStable(stations) {
@@ -138,6 +164,8 @@
                 const title = stationTitle(entry);
                 const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
+                const portSessions =
+                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -146,9 +174,18 @@
                         title,
                         status: entry.station_status || "unknown",
                         sort: statusBucket(entry.station_status),
+                        sessionStartedAt: null,
+                        policyCompleteSince: null,
                     });
                 } else {
                     for (const pk of keys) {
+                        const sess = portSessions[pk];
+                        const sessionStartedAt =
+                            sess && typeof sess === "object" && sess.started_at ? String(sess.started_at) : null;
+                        const policyCompleteSince =
+                            sess && typeof sess === "object" && sess.policy_complete_since
+                                ? String(sess.policy_complete_since)
+                                : null;
                         rows.push({
                             key: `${id}-${pk}`,
                             deviceId: id,
@@ -156,6 +193,8 @@
                             title,
                             status: ports[pk],
                             sort: statusBucket(ports[pk]),
+                            sessionStartedAt,
+                            policyCompleteSince,
                         });
                     }
                 }
@@ -171,12 +210,60 @@
             return rows;
         }
 
-        function flattenPortsSortedByStatus(stations) {
-            const rows = flattenPortsStable(stations);
+        function parseIsoToMs(raw) {
+            if (raw == null || raw === "") return NaN;
+            if (typeof raw === "number" && Number.isFinite(raw)) {
+                return raw > 1e12 ? raw : raw * 1000;
+            }
+            if (typeof raw === "string") {
+                const p = Date.parse(raw);
+                if (!Number.isNaN(p)) return p;
+            }
+            return NaN;
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap) {
+            const start = parseIsoToMs(row.sessionStartedAt);
+            if (!Number.isFinite(start)) return null;
+            const base = start + limitMin * 60 * 1000;
+            const ext = extMap[row.key];
+            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            return base;
+        }
+
+        /** Lot + “complete” list use co-op policy; falls back to ChargePoint if no session clock yet. */
+        function effectiveBucket(row, limitMin, extMap, now) {
+            const cp = statusBucket(row.status);
+            if (cp === "available") return "available";
+            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            if (deadline == null) return cp;
+            if (now >= deadline) return "complete";
+            if (cp === "charging" || cp === "complete") return "charging";
+            return cp;
+        }
+
+        function annotateRows(stations, extMap, now) {
+            const limitMin = Number(stations?.charging_limit_minutes);
+            const lim = Number.isFinite(limitMin) && limitMin > 0 ? limitMin : 120;
+            const stable = flattenPortsStable(stations);
+            return stable.map((r) => {
+                const cpBucket = statusBucket(r.status);
+                return {
+                    ...r,
+                    cpBucket,
+                    eff: effectiveBucket(r, lim, extMap, now),
+                    deadlineMs: policyDeadlineMs(r, lim, extMap),
+                    limitMin: lim,
+                };
+            });
+        }
+
+        function flattenPortsSortedByStatus(stations, extMap, now) {
+            const rows = annotateRows(stations, extMap, now);
             const order = { available: 0, charging: 1, complete: 2, other: 3 };
             rows.sort(
                 (a, b) =>
-                    (order[a.sort] ?? 9) - (order[b.sort] ?? 9) || a.title.localeCompare(b.title)
+                    (order[a.eff] ?? 9) - (order[b.eff] ?? 9) || a.title.localeCompare(b.title)
             );
             return rows;
         }
@@ -216,7 +303,14 @@
             return { text: "Unknown", class: "text-stone-500" };
         }
 
-        function renderParkingLot(slots) {
+        function escAttr(s) {
+            return String(s)
+                .replace(/&/g, "&amp;")
+                .replace(/"/g, "&quot;")
+                .replace(/</g, "&lt;");
+        }
+
+        function renderParkingLot(slots, extMap) {
             if (slots.every((s) => s === null)) {
                 parkingLotEl.innerHTML = `<div class="col-span-full text-sm text-stone-500 py-8 text-center border border-dashed border-stone-600 rounded-lg">No station data.</div>`;
                 return;
@@ -231,27 +325,43 @@
                         <div class="flex-1 flex items-center justify-center text-stone-600 text-xs">—</div>
                     </div>`;
                     }
-                    const bucket = statusBucket(r.status);
+                    const bucket = r.eff;
+                    const cpBucket = r.cpBucket;
                     const label = r.portLabel ? `${r.title} · ${r.portLabel}` : r.title;
                     const { text: stText, class: stClass } = stallStatusLabel(bucket);
                     const showCar = bucket === "charging";
                     const variant = carVariantForKey(r.key);
+                    const cpEarly =
+                        bucket === "charging" && cpBucket === "complete"
+                            ? `<div class="text-[10px] text-stone-500 text-center mt-1 leading-tight">ChargePoint: session complete · co-op timer still running</div>`
+                            : "";
                     const idleHint =
                         bucket === "available"
                             ? "No vehicle"
                             : bucket === "complete"
-                              ? "Session complete"
+                              ? "Move vehicle"
                               : "";
                     const carHtml = showCar
-                        ? carSvg(variant)
+                        ? `<div class="relative w-full pt-5"><button type="button" data-extend-key="${escAttr(
+                              r.key
+                          )}" class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-500 text-stone-300 hover:border-samtec-orange hover:text-samtec-orange bg-black/60">Extend</button>${carSvg(
+                              variant
+                          )}</div>`
                         : `<div class="flex-1 flex items-center justify-center text-stone-600 text-[11px] px-1 text-center">${idleHint}</div>`;
+                    const ext = extMap[r.key];
+                    const extLine =
+                        ext && ext.by
+                            ? `<div class="text-[10px] text-stone-500 text-center mt-1">Extended by ${escAttr(ext.by)}</div>`
+                            : "";
 
                     return `
-                <div class="rounded-lg border-2 ${showCar ? "border-samtec-orange shadow-[0_0_20px_rgba(234,88,12,0.25)]" : "border-stone-700"} bg-samtec-asphalt p-3 flex flex-col min-h-[11rem]">
-                    <div class="text-[10px] tracking-widest text-stone-500 uppercase mb-1 truncate" title="${label}">Spot ${n}</div>
-                    <div class="text-xs text-stone-400 mb-2 line-clamp-2 min-h-[2rem]">${label}</div>
+                <div class="rounded-lg border-2 ${showCar ? "border-samtec-orange shadow-[0_0_20px_rgba(234,88,12,0.25)]" : "border-stone-700"} bg-samtec-asphalt p-3 flex flex-col min-h-[11rem] relative">
+                    <div class="text-[10px] tracking-widest text-stone-500 uppercase mb-1 truncate" title="${escAttr(label)}">Spot ${n}</div>
+                    <div class="text-xs text-stone-400 mb-2 line-clamp-2 min-h-[2rem]">${escAttr(label)}</div>
                     <div class="flex-1 flex flex-col justify-center stall-lines rounded min-h-[5.5rem] px-1">${carHtml}</div>
+                    ${cpEarly}
                     <div class="mt-2 text-center text-xs ${stClass}">${stText}</div>
+                    ${extLine}
                 </div>`;
                 })
                 .join("");
@@ -260,8 +370,7 @@
         function updateCompleteTracking(rows) {
             const seen = new Set();
             for (const r of rows) {
-                const bucket = statusBucket(r.status);
-                if (bucket !== "complete") {
+                if (r.eff !== "complete") {
                     completeSince.delete(r.key);
                     continue;
                 }
@@ -274,19 +383,23 @@
         }
 
         function renderCompleteList(rows) {
-            const completeRows = rows.filter((r) => statusBucket(r.status) === "complete");
+            const completeRows = rows.filter((r) => r.eff === "complete");
             if (completeRows.length === 0) {
                 completeListEl.innerHTML = `<div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>`;
                 return;
             }
             completeListEl.innerHTML = completeRows
                 .map((r) => {
-                    const started = completeSince.get(r.key) ?? Date.now();
+                    const policyMs = parseIsoToMs(r.policyCompleteSince);
+                    const tabMs = completeSince.get(r.key) ?? Date.now();
+                    const started = Number.isFinite(policyMs) ? policyMs : tabMs;
                     const over = formatDuration(Date.now() - started);
                     const label = r.portLabel ? `${r.title} (${r.portLabel})` : r.title;
                     return `
-                <div class="flex justify-between gap-3 px-4 py-3 border-b border-stone-800 last:border-0 complete-row bg-black/20" data-key="${r.key}">
-                    <span class="text-stone-300 text-sm">${label}</span>
+                <div class="flex justify-between gap-3 px-4 py-3 border-b border-stone-800 last:border-0 complete-row bg-black/20" data-key="${escAttr(
+                    r.key
+                )}">
+                    <span class="text-stone-300 text-sm">${escAttr(label)}</span>
                     <span class="text-orange-400 font-semibold text-sm shrink-0 complete-duration">Complete · ${over}</span>
                 </div>`;
                 })
@@ -349,28 +462,33 @@
             }
         }
 
+        function renderFromCache() {
+            const data = lastStationPayload;
+            if (!data) {
+                lastPollerIso = null;
+                lastRowsSorted = [];
+                refreshLiveIndicator();
+                parkingLotEl.innerHTML = `<div class="col-span-full text-sm text-stone-500 py-8 text-center border border-dashed border-stone-600 rounded-lg">No data at /stations</div>`;
+                completeListEl.innerHTML = `<div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>`;
+                return;
+            }
+            lastPollerIso = data.last_updated ?? null;
+            const ext = lastExtMap && typeof lastExtMap === "object" ? lastExtMap : {};
+            const now = Date.now();
+            const annotatedStable = annotateRows(data, ext, now);
+            const slots = stallSlotsFromRows(annotatedStable);
+            renderParkingLot(slots, ext);
+            lastRowsSorted = flattenPortsSortedByStatus(data, ext, now);
+            updateCompleteTracking(lastRowsSorted);
+            renderCompleteList(lastRowsSorted);
+            refreshLiveIndicator();
+        }
+
         onValue(
             stationsRef,
             (snap) => {
-                const data = snap.val();
-                if (!data) {
-                    lastPollerIso = null;
-                    lastRowsSorted = [];
-                    refreshLiveIndicator();
-                    parkingLotEl.innerHTML = `<div class="col-span-full text-sm text-stone-500 py-8 text-center border border-dashed border-stone-600 rounded-lg">No data at /stations</div>`;
-                    completeListEl.innerHTML = `<div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>`;
-                    return;
-                }
-                lastPollerIso = data.last_updated ?? null;
-                refreshLiveIndicator();
-
-                const stable = flattenPortsStable(data);
-                const slots = stallSlotsFromRows(stable);
-                renderParkingLot(slots);
-
-                lastRowsSorted = flattenPortsSortedByStatus(data);
-                updateCompleteTracking(lastRowsSorted);
-                renderCompleteList(lastRowsSorted);
+                lastStationPayload = snap.val();
+                renderFromCache();
             },
             (err) => {
                 console.error(err);
@@ -379,17 +497,84 @@
             }
         );
 
+        onValue(
+            extensionsRef,
+            (snap) => {
+                lastExtMap = snap.val() || {};
+                if (lastStationPayload) renderFromCache();
+            },
+            (err) => {
+                console.error(err);
+            }
+        );
+
+        parkingLotEl.addEventListener("click", (e) => {
+            const btn = e.target.closest("[data-extend-key]");
+            if (!btn) return;
+            const key = btn.getAttribute("data-extend-key");
+            if (!key) return;
+            pendingExtendKey = key;
+            extendNameInput.value = "";
+            extendMinutesInput.value = "120";
+            extendModal.classList.remove("hidden");
+            extendModal.setAttribute("aria-hidden", "false");
+            extendNameInput.focus();
+        });
+
+        function closeExtendModal() {
+            pendingExtendKey = null;
+            extendModal.classList.add("hidden");
+            extendModal.setAttribute("aria-hidden", "true");
+        }
+
+        extendCancelBtn.addEventListener("click", closeExtendModal);
+        extendModal.addEventListener("click", (e) => {
+            if (e.target === extendModal) closeExtendModal();
+        });
+
+        extendSaveBtn.addEventListener("click", async () => {
+            if (!pendingExtendKey) return;
+            const name = extendNameInput.value.trim();
+            const extra = Math.min(480, Math.max(15, parseInt(extendMinutesInput.value, 10) || 120));
+            if (!name) {
+                alert("Enter your name.");
+                return;
+            }
+            if (!lastStationPayload) return;
+            const rows = annotateRows(lastStationPayload, lastExtMap || {}, Date.now());
+            const row = rows.find((r) => r.key === pendingExtendKey);
+            if (!row) {
+                alert("Spot not found.");
+                return;
+            }
+            const start = parseIsoToMs(row.sessionStartedAt);
+            if (!Number.isFinite(start)) {
+                alert("Session clock not ready yet — wait for the next poller run (up to ~5 min).");
+                return;
+            }
+            const base = start + row.limitMin * 60 * 1000;
+            const prev = (lastExtMap || {})[row.key] || {};
+            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
+            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            try {
+                await set(ref(db, `slot_extensions/${row.key}`), {
+                    by: name,
+                    at: new Date().toISOString(),
+                    extra_minutes: extra,
+                    until_ms: newUntil,
+                });
+                closeExtendModal();
+            } catch (err) {
+                console.error(err);
+                alert(
+                    "Could not save extension. In Firebase Realtime Database rules, allow read/write for /slot_extensions (see database.rules.json in this repo)."
+                );
+            }
+        });
+
         setInterval(() => {
-            refreshLiveIndicator();
-            if (lastRowsSorted.length === 0) return;
-            renderCompleteList(lastRowsSorted);
-            document.querySelectorAll(".complete-row").forEach((el) => {
-                const key = el.getAttribute("data-key");
-                const dur = el.querySelector(".complete-duration");
-                if (!dur || !key) return;
-                const started = completeSince.get(key);
-                if (started) dur.textContent = `Complete · ${formatDuration(Date.now() - started)}`;
-            });
+            if (lastStationPayload) renderFromCache();
+            else refreshLiveIndicator();
         }, 1000);
     </script>
 </body>

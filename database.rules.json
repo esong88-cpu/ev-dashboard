@@ -1,0 +1,12 @@
+{
+  "rules": {
+    "stations": {
+      ".read": true,
+      ".write": false
+    },
+    "slot_extensions": {
+      ".read": true,
+      ".write": true
+    }
+  }
+}
