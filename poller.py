@@ -18,7 +18,10 @@ from firebase_admin import credentials, db
 from requests import codes
 
 from python_chargepoint import ChargePoint
-from python_chargepoint.exceptions import ChargePointCommunicationException
+from python_chargepoint.exceptions import (
+    ChargePointCommunicationException,
+    ChargePointLoginError,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +112,24 @@ def _collect_ports_from_station_json(data: Dict[str, Any]) -> List[Tuple[int, st
     return out
 
 
+def _rtdb_map(obj: Any) -> Dict[str, Any]:
+    """
+    Firebase Realtime Database may return a list instead of a dict when keys look
+    like a dense 0..n-1 sequence. Normalize to string-keyed dict (1-based indices).
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return {str(k): v for k, v in obj.items()}
+    if isinstance(obj, list):
+        out: Dict[str, Any] = {}
+        for i, v in enumerate(obj):
+            if v is not None:
+                out[str(i + 1)] = v
+        return out
+    return {}
+
+
 def _session_occupancy_bucket(label: str) -> str:
     """available vs still plugged / in use (charging or CP-reported complete)."""
     n = (label or "").strip().lower()
@@ -139,9 +160,9 @@ def enrich_stations_with_port_sessions(
         prev_entry = prev_stations.get(sid) or {}
         if not isinstance(prev_entry, dict):
             prev_entry = {}
-        prev_ports = prev_entry.get("ports") or {}
-        prev_sess = prev_entry.get("port_sessions") or {}
-        ports = entry.get("ports") or {}
+        prev_ports = _rtdb_map(prev_entry.get("ports"))
+        prev_sess = _rtdb_map(prev_entry.get("port_sessions"))
+        ports = _rtdb_map(entry.get("ports"))
         if not ports:
             continue
 
@@ -225,12 +246,11 @@ def enrich_policy_complete_since(
         if not isinstance(entry, dict) or entry.get("error"):
             continue
         prev_entry = prev_stations.get(sid) or {}
-        prev_ps = prev_entry.get("port_sessions") or {}
-        if not isinstance(prev_ps, dict):
-            prev_ps = {}
-        ports = entry.get("ports") or {}
+        prev_ps = _rtdb_map(prev_entry.get("port_sessions"))
+        ports = _rtdb_map(entry.get("ports"))
         psessions = entry.get("port_sessions")
-        if not isinstance(psessions, dict):
+        psessions = _rtdb_map(psessions) if psessions is not None else {}
+        if not psessions:
             continue
 
         for pk_s, sub in list(psessions.items()):
@@ -397,11 +417,24 @@ def main() -> None:
     init_firebase(database_url)
 
     logger.info("Logging in to ChargePoint…")
-    client = ChargePoint(
-        username,
-        password if password else "unused",
-        session_token=session_token,
-    )
+    try:
+        client = ChargePoint(
+            username,
+            password if password else "unused",
+            session_token=session_token,
+        )
+    except ChargePointLoginError as exc:
+        resp = exc.args[0] if exc.args and hasattr(exc.args[0], "text") else None
+        err_text = (getattr(resp, "text", None) or str(exc)) if resp is not None else str(exc)
+        if "403" in err_text or "captcha" in err_text.lower() or "ad blocker" in err_text.lower():
+            logger.error(
+                "ChargePoint returned a bot-protection page (403 / captcha). "
+                "Password login from cloud IPs (e.g. GitHub Actions) is often blocked. "
+                "Fix: set secret CHARGEPOINT_SESSION_TOKEN to a valid browser session token "
+                "(see .env.example); the poller uses it without hitting the login endpoint. "
+                "Refresh the token periodically when API calls start failing."
+            )
+        raise
 
     try:
         home_ids = set(client.get_home_chargers())
