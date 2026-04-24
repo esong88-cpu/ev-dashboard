@@ -43,12 +43,37 @@
                 rgba(68, 64, 60, 0.5) 10px
             );
         }
+        /* TV / wall: add ?kiosk=1 to the URL */
+        body.kiosk-mode {
+            font-size: 1.0625rem;
+        }
+        body.kiosk-mode #main-wrap {
+            max-width: 96rem;
+        }
+        body.kiosk-mode h1 {
+            font-size: clamp(1.5rem, 4.5vw, 2.75rem);
+        }
+        body.kiosk-mode #status-summary {
+            font-size: clamp(1.05rem, 2.8vw, 1.45rem);
+            margin-top: 0.75rem;
+        }
+        body.kiosk-mode h2 {
+            font-size: 0.7rem;
+            margin-bottom: 0.9rem;
+        }
+        body.kiosk-mode #parking-lot {
+            gap: clamp(0.9rem, 1.2vw, 1.4rem);
+        }
+        @media (min-width: 1024px) {
+            body.kiosk-mode #parking-lot { gap: 1.4rem; }
+        }
     </style>
 </head>
 <body class="min-h-screen bg-samtec-dark text-stone-300 font-mono antialiased">
-    <div class="max-w-5xl mx-auto px-4 py-6 sm:px-6 sm:py-10">
+    <div id="main-wrap" class="max-w-5xl mx-auto px-4 py-6 sm:px-6 sm:py-10">
         <header class="border-b-2 border-samtec-orange pb-6 mb-8">
             <h1 class="text-xl sm:text-2xl font-bold tracking-[0.2em] text-samtec-orange uppercase">Samtec EV Chargers</h1>
+            <p id="status-summary" class="text-sm sm:text-base text-stone-200 mt-2 font-semibold tabular-nums" aria-live="polite">—</p>
             <div class="flex items-center gap-2 mt-3 text-sm text-stone-400">
                 <span id="live-dot" class="w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0"></span>
                 <span id="live-label">connecting…</span>
@@ -106,8 +131,19 @@
         const stationsRef = ref(db, "/stations");
         const extensionsRef = ref(db, "/slot_extensions");
 
+        const params = new URLSearchParams(window.location.search);
+        const isKiosk =
+            params.get("kiosk") === "1" ||
+            params.get("kiosk") === "true" ||
+            params.get("kiosk") === "yes";
+        if (isKiosk) {
+            document.body.classList.add("kiosk-mode");
+            document.title = "Samtec EV — Board";
+        }
+
         const liveDot = document.getElementById("live-dot");
         const liveLabel = document.getElementById("live-label");
+        const statusSummaryEl = document.getElementById("status-summary");
         const completeListEl = document.getElementById("complete-list");
         const parkingLotEl = document.getElementById("parking-lot");
         const extendModal = document.getElementById("extend-modal");
@@ -472,11 +508,43 @@
             }
         }
 
+        function updateStatusSummary(slots) {
+            if (!statusSummaryEl) return;
+            if (!slots || !Array.isArray(slots)) {
+                statusSummaryEl.textContent = "—";
+                return;
+            }
+            let open = 0;
+            let charging = 0;
+            let move = 0;
+            let emptyStall = 0;
+            let other = 0;
+            for (const r of slots) {
+                if (!r) {
+                    emptyStall++;
+                    continue;
+                }
+                if (r.eff === "available") open++;
+                else if (r.eff === "charging") charging++;
+                else if (r.eff === "complete") move++;
+                else other++;
+            }
+            let line = `${open} open · ${charging} charging · ${move} move the car`;
+            if (emptyStall > 0) {
+                line += ` · ${emptyStall} spot${emptyStall === 1 ? "" : "s"} unassigned`;
+            }
+            if (other > 0) {
+                line += ` · ${other} other`;
+            }
+            statusSummaryEl.textContent = line;
+        }
+
         function renderFromCache() {
             const data = lastStationPayload;
             if (!data) {
                 lastPollerIso = null;
                 lastRowsSorted = [];
+                if (statusSummaryEl) statusSummaryEl.textContent = "—";
                 refreshLiveIndicator();
                 parkingLotEl.innerHTML = `<div class="col-span-full text-sm text-stone-500 py-8 text-center border border-dashed border-stone-600 rounded-lg">No data at /stations</div>`;
                 completeListEl.innerHTML = `<div class="text-sm text-stone-500 px-4 py-3 border-b border-stone-800">None right now.</div>`;
@@ -487,6 +555,7 @@
             const now = Date.now();
             const annotatedStable = annotateRows(data, ext, now);
             const slots = stallSlotsFromRows(annotatedStable);
+            updateStatusSummary(slots);
             renderParkingLot(slots, ext);
             lastRowsSorted = flattenPortsSortedByStatus(data, ext, now);
             updateCompleteTracking(lastRowsSorted);
