@@ -146,7 +146,18 @@
 
         function stationTitle(entry) {
             const n = entry.name;
-            if (Array.isArray(n)) return n.filter(Boolean).join(" ").trim();
+            if (Array.isArray(n)) {
+                const parts = n.map((s) => String(s).trim()).filter(Boolean);
+                if (parts.length >= 2) {
+                    const first = parts[0].toLowerCase();
+                    const second = parts[1].toLowerCase();
+                    // ChargePoint often sends e.g. ["Samtec", "Samtec 01"] — avoid "Samtec Samtec 01".
+                    if (second === first || second.startsWith(first + " ")) {
+                        return parts.slice(1).join(" ").trim();
+                    }
+                }
+                return parts.join(" ").trim();
+            }
             if (typeof n === "string") return n;
             return `Station ${entry.device_id ?? "?"}`;
         }
