@@ -33,7 +33,12 @@
             0%, 100% { filter: drop-shadow(0 0 6px rgba(234, 88, 12, 0.9)); opacity: 1; }
             50% { filter: drop-shadow(0 0 14px rgba(251, 146, 60, 1)); opacity: 0.95; }
         }
+        @keyframes overdue-pulse {
+            0%, 100% { filter: drop-shadow(0 0 7px rgba(220, 38, 38, 0.95)); opacity: 1; }
+            50% { filter: drop-shadow(0 0 18px rgba(248, 113, 113, 1)); opacity: 0.9; }
+        }
         .car-charging { animation: charge-pulse 2s ease-in-out infinite; }
+        .car-overdue { animation: overdue-pulse 1.35s ease-in-out infinite; }
         .stall-lines {
             background-image: repeating-linear-gradient(
                 90deg,
@@ -326,8 +331,8 @@
             return h % 3;
         }
 
-        /** Simple side-view cars in Samtec orange (SVG). */
-        function carSvg(variant) {
+        /** Simple side-view cars. Orange = within window; red = time to move. */
+        function carSvg(variant, mode = "charging") {
             const bodies = [
                 "M8 38h104c4 0 8-3 8-8V22c0-6-5-11-11-11H25l-8-6H8v33z M28 18h72v12H28z",
                 "M6 36h108l6-4c3-2 5-5 5-9V20c0-7-6-12-13-12H22l-6-5H6v33z M30 16h68v14H30z",
@@ -335,8 +340,11 @@
             ];
             const wheels = "M22 44h10v6H22zm66 0h10v6H88z";
             const v = bodies[variant] || bodies[0];
-            return `<svg viewBox="0 0 120 52" class="w-full h-auto max-h-[7rem] mx-auto car-charging" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-                <path fill="#ea580c" d="${v}"/>
+            const overdue = mode === "overdue";
+            const fill = overdue ? "#dc2626" : "#ea580c";
+            const cls = overdue ? "car-overdue" : "car-charging";
+            return `<svg viewBox="0 0 120 52" class="w-full h-auto max-h-[7rem] mx-auto ${cls}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path fill="${fill}" d="${v}"/>
                 <path fill="#0a0a0a" d="${wheels}"/>
                 <path fill="#292524" opacity="0.35" d="M38 20h44v8H38z"/>
             </svg>`;
@@ -375,24 +383,22 @@
                     const cpBucket = r.cpBucket;
                     const label = r.portLabel ? `${r.title} · ${r.portLabel}` : r.title;
                     const { text: stText, class: stClass } = stallStatusLabel(bucket);
-                    const showCar = bucket === "charging";
+                    const showCar = bucket === "charging" || bucket === "complete";
+                    const isOverdue = bucket === "complete";
                     const variant = carVariantForKey(r.key);
                     const cpEarly =
                         bucket === "charging" && cpBucket === "complete"
                             ? `<div class="text-[10px] text-stone-500 text-center mt-1 leading-tight">ChargePoint: session complete · co-op timer still running</div>`
                             : "";
-                    const idleHint =
-                        bucket === "available"
-                            ? "No vehicle"
-                            : bucket === "complete"
-                              ? "Move vehicle"
-                              : "";
+                    const idleHint = bucket === "available" ? "No vehicle" : "";
                     const carHtml = showCar
-                        ? `<div class="relative w-full pt-5"><button type="button" data-extend-key="${escAttr(
-                              r.key
-                          )}" class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-500 text-stone-300 hover:border-samtec-orange hover:text-samtec-orange bg-black/60">Extend</button>${carSvg(
-                              variant
-                          )}</div>`
+                        ? `<div class="relative w-full pt-5">${
+                              isOverdue
+                                  ? `<div class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-red-500 text-red-300 bg-black/70">Move</div>`
+                                  : `<button type="button" data-extend-key="${escAttr(
+                                        r.key
+                                    )}" class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-500 text-stone-300 hover:border-samtec-orange hover:text-samtec-orange bg-black/60">Extend</button>`
+                          }${carSvg(variant, isOverdue ? "overdue" : "charging")}</div>`
                         : `<div class="flex-1 flex items-center justify-center text-stone-600 text-[11px] px-1 text-center">${idleHint}</div>`;
                     const ext = extMap[r.key];
                     const extLine =
@@ -408,7 +414,13 @@
                             : "";
 
                     return `
-                <div class="rounded-lg border-2 ${showCar ? "border-samtec-orange shadow-[0_0_20px_rgba(234,88,12,0.25)]" : "border-stone-700"} bg-samtec-asphalt p-3 flex flex-col min-h-[11rem] relative">
+                <div class="rounded-lg border-2 ${
+                    isOverdue
+                        ? "border-red-600 shadow-[0_0_22px_rgba(220,38,38,0.3)]"
+                        : showCar
+                          ? "border-samtec-orange shadow-[0_0_20px_rgba(234,88,12,0.25)]"
+                          : "border-stone-700"
+                } bg-samtec-asphalt p-3 flex flex-col min-h-[11rem] relative">
                     <div class="text-[10px] tracking-widest text-stone-500 uppercase mb-1 truncate" title="${escAttr(label)}">Spot ${n}</div>
                     <div class="text-xs text-stone-400 mb-2 line-clamp-2 min-h-[2rem]">${escAttr(label)}</div>
                     <div class="flex-1 flex flex-col justify-center stall-lines rounded min-h-[5.5rem] px-1">${carHtml}</div>
