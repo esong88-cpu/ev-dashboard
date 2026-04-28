@@ -115,7 +115,11 @@ def _collect_ports_from_station_json(data: Dict[str, Any]) -> List[Tuple[int, st
 def _rtdb_map(obj: Any) -> Dict[str, Any]:
     """
     Firebase Realtime Database may return a list instead of a dict when keys look
-    like a dense 0..n-1 sequence. Normalize to string-keyed dict (1-based indices).
+    like a dense integer sequence. Normalize to string-keyed dict.
+
+    If we write keys "1" and "2", RTDB can return [None, value1, value2].
+    Preserve the actual array index as the key so previous port "1" still
+    matches current port "1".
     """
     if obj is None:
         return {}
@@ -125,7 +129,7 @@ def _rtdb_map(obj: Any) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for i, v in enumerate(obj):
             if v is not None:
-                out[str(i + 1)] = v
+                out[str(i)] = v
         return out
     return {}
 
