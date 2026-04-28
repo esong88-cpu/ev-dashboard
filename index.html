@@ -399,6 +399,13 @@
                         ext && ext.by
                             ? `<div class="text-[10px] text-stone-500 text-center mt-1">Extended by ${escAttr(ext.by)}</div>`
                             : "";
+                    const sessionStartMs = parseIsoToMs(r.sessionStartedAt);
+                    const hereLine =
+                        bucket !== "available" && Number.isFinite(sessionStartMs)
+                            ? `<div class="text-[10px] text-stone-500 text-center mt-1">Here · ${formatDuration(
+                                  Date.now() - sessionStartMs
+                              )}</div>`
+                            : "";
 
                     return `
                 <div class="rounded-lg border-2 ${showCar ? "border-samtec-orange shadow-[0_0_20px_rgba(234,88,12,0.25)]" : "border-stone-700"} bg-samtec-asphalt p-3 flex flex-col min-h-[11rem] relative">
@@ -407,6 +414,7 @@
                     <div class="flex-1 flex flex-col justify-center stall-lines rounded min-h-[5.5rem] px-1">${carHtml}</div>
                     ${cpEarly}
                     <div class="mt-2 text-center text-xs ${stClass}">${stText}</div>
+                    ${hereLine}
                     ${extLine}
                 </div>`;
                 })
