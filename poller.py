@@ -143,7 +143,7 @@ def _session_occupancy_bucket(label: str) -> str:
 
 
 def enrich_stations_with_port_sessions(
-    prev_root: Dict[str, Any], stations: Dict[str, Any]
+    prev_root: Dict[str, Any], stations: Dict[str, Any], reset_map: Dict[str, Any]
 ) -> List[str]:
     """
     Attach port_sessions.started_at per port when occupied; clear when available.
@@ -185,9 +185,20 @@ def enrich_stations_with_port_sessions(
 
             old_start = (prev_sess.get(pk_s) or {}).get("started_at")
             if not was_occ or not old_start:
-                new_sess[pk_s] = {"started_at": now_iso}
+                started_at = now_iso
             else:
-                new_sess[pk_s] = {"started_at": old_start}
+                started_at = old_start
+
+            reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
+            if isinstance(reset, dict):
+                reset_ms = reset.get("at_ms")
+                reset_iso = str(reset.get("at") or "")
+                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
+                    started_at = reset_iso or datetime.fromtimestamp(
+                        reset_ms / 1000, tz=timezone.utc
+                    ).isoformat()
+
+            new_sess[pk_s] = {"started_at": started_at}
 
         if new_sess:
             entry["port_sessions"] = new_sess
@@ -449,7 +460,10 @@ def main() -> None:
     ref = db.reference("/stations")
     prev_root = ref.get() or {}
     payload = poll_once(client, station_ids, home_ids)
-    cleared_ext_keys = enrich_stations_with_port_sessions(prev_root, payload)
+    reset_map = db.reference("/slot_resets").get() or {}
+    if not isinstance(reset_map, dict):
+        reset_map = {}
+    cleared_ext_keys = enrich_stations_with_port_sessions(prev_root, payload, reset_map)
     limit_raw = (os.getenv("CHARGING_LIMIT_MINUTES") or "120").strip()
     try:
         charging_limit_minutes = max(1, int(limit_raw))
@@ -472,12 +486,14 @@ def main() -> None:
 
     if cleared_ext_keys:
         ext_root = db.reference("/slot_extensions")
+        reset_root = db.reference("/slot_resets")
         for key in dict.fromkeys(cleared_ext_keys):
             try:
                 # null value in update removes the child (works across firebase-admin versions).
                 ext_root.update({key: None})
+                reset_root.update({key: None})
             except Exception as exc:
-                logger.warning("Could not clear slot_extensions/%s: %s", key, exc)
+                logger.warning("Could not clear per-slot metadata for %s: %s", key, exc)
     logger.info(
         "Updated /stations (last_updated=%s): %s",
         last_updated,

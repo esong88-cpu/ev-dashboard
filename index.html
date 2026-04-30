@@ -135,6 +135,7 @@
         const db = getDatabase(app);
         const stationsRef = ref(db, "/stations");
         const extensionsRef = ref(db, "/slot_extensions");
+        const resetsRef = ref(db, "/slot_resets");
 
         const params = new URLSearchParams(window.location.search);
         const isKiosk =
@@ -162,6 +163,7 @@
 
         let lastStationPayload = null;
         let lastExtMap = {};
+        let lastResetMap = {};
         let pendingExtendKey = null;
 
         function normStatus(s) {
@@ -293,24 +295,35 @@
             return cp;
         }
 
-        function annotateRows(stations, extMap, now) {
+        function annotateRows(stations, extMap, resetMap, now) {
             const limitMin = Number(stations?.charging_limit_minutes);
             const lim = Number.isFinite(limitMin) && limitMin > 0 ? limitMin : 120;
             const stable = flattenPortsStable(stations);
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
+                const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
+                const resetMs =
+                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
+                        ? reset.at_ms
+                        : NaN;
+                const startMs = parseIsoToMs(r.sessionStartedAt);
+                const sessionStartedAt =
+                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
+                        ? reset.at || new Date(resetMs).toISOString()
+                        : r.sessionStartedAt;
+                const row = { ...r, sessionStartedAt };
                 return {
-                    ...r,
+                    ...row,
                     cpBucket,
-                    eff: effectiveBucket(r, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(r, lim, extMap),
+                    eff: effectiveBucket(row, lim, extMap, now),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap),
                     limitMin: lim,
                 };
             });
         }
 
-        function flattenPortsSortedByStatus(stations, extMap, now) {
-            const rows = annotateRows(stations, extMap, now);
+        function flattenPortsSortedByStatus(stations, extMap, resetMap, now) {
+            const rows = annotateRows(stations, extMap, resetMap, now);
             const order = { available: 0, charging: 1, complete: 2, other: 3 };
             rows.sort(
                 (a, b) =>
@@ -391,14 +404,19 @@
                             ? `<div class="text-[10px] text-stone-500 text-center mt-1 leading-tight">ChargePoint: session complete · co-op timer still running</div>`
                             : "";
                     const idleHint = bucket === "available" ? "No vehicle" : "";
+                    const resetButton = `<button type="button" data-reset-key="${escAttr(
+                        r.key
+                    )}" class="absolute top-0 left-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-600 text-stone-400 hover:border-sky-400 hover:text-sky-300 bg-black/60">Reset</button>`;
+                    const statusButton = isOverdue
+                        ? `<div class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-red-500 text-red-300 bg-black/70">Move</div>`
+                        : `<button type="button" data-extend-key="${escAttr(
+                              r.key
+                          )}" class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-500 text-stone-300 hover:border-samtec-orange hover:text-samtec-orange bg-black/60">Extend</button>`;
                     const carHtml = showCar
-                        ? `<div class="relative w-full pt-5">${
-                              isOverdue
-                                  ? `<div class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-red-500 text-red-300 bg-black/70">Move</div>`
-                                  : `<button type="button" data-extend-key="${escAttr(
-                                        r.key
-                                    )}" class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-500 text-stone-300 hover:border-samtec-orange hover:text-samtec-orange bg-black/60">Extend</button>`
-                          }${carSvg(variant, isOverdue ? "overdue" : "charging")}</div>`
+                        ? `<div class="relative w-full pt-5">${resetButton}${statusButton}${carSvg(
+                              variant,
+                              isOverdue ? "overdue" : "charging"
+                          )}</div>`
                         : `<div class="flex-1 flex items-center justify-center text-stone-600 text-[11px] px-1 text-center">${idleHint}</div>`;
                     const ext = extMap[r.key];
                     const extLine =
@@ -572,12 +590,13 @@
             }
             lastPollerIso = data.last_updated ?? null;
             const ext = lastExtMap && typeof lastExtMap === "object" ? lastExtMap : {};
+            const resets = lastResetMap && typeof lastResetMap === "object" ? lastResetMap : {};
             const now = Date.now();
-            const annotatedStable = annotateRows(data, ext, now);
+            const annotatedStable = annotateRows(data, ext, resets, now);
             const slots = stallSlotsFromRows(annotatedStable);
             updateStatusSummary(slots);
             renderParkingLot(slots, ext);
-            lastRowsSorted = flattenPortsSortedByStatus(data, ext, now);
+            lastRowsSorted = flattenPortsSortedByStatus(data, ext, resets, now);
             updateCompleteTracking(lastRowsSorted);
             renderCompleteList(lastRowsSorted);
             refreshLiveIndicator();
@@ -607,7 +626,39 @@
             }
         );
 
+        onValue(
+            resetsRef,
+            (snap) => {
+                lastResetMap = snap.val() || {};
+                if (lastStationPayload) renderFromCache();
+            },
+            (err) => {
+                console.error(err);
+            }
+        );
+
         parkingLotEl.addEventListener("click", (e) => {
+            const resetBtn = e.target.closest("[data-reset-key]");
+            if (resetBtn) {
+                const key = resetBtn.getAttribute("data-reset-key");
+                if (!key) return;
+                const ok = confirm("Reset this spot's timer because a new car just parked here?");
+                if (!ok) return;
+                const now = Date.now();
+                set(ref(db, `slot_resets/${key}`), {
+                    at: new Date(now).toISOString(),
+                    at_ms: now,
+                })
+                    .then(() => set(ref(db, `slot_extensions/${key}`), null))
+                    .catch((err) => {
+                        console.error(err);
+                        alert(
+                            "Could not reset timer. In Firebase Realtime Database rules, allow read/write for /slot_resets."
+                        );
+                    });
+                return;
+            }
+
             const btn = e.target.closest("[data-extend-key]");
             if (!btn) return;
             const key = btn.getAttribute("data-extend-key");
@@ -640,7 +691,7 @@
                 return;
             }
             if (!lastStationPayload) return;
-            const rows = annotateRows(lastStationPayload, lastExtMap || {}, Date.now());
+            const rows = annotateRows(lastStationPayload, lastExtMap || {}, lastResetMap || {}, Date.now());
             const row = rows.find((r) => r.key === pendingExtendKey);
             if (!row) {
                 alert("Spot not found.");
