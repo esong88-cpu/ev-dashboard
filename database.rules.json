@@ -8,7 +8,7 @@
       ".read": true,
       "$slot": {
         ".write": true,
-        ".validate": "newData.hasChildren(['by', 'at', 'extra_minutes', 'until_ms']) && newData.child('by').isString() && newData.child('by').val().length <= 80 && newData.child('at').isString() && newData.child('at').val().length <= 40 && newData.child('extra_minutes').isNumber() && newData.child('extra_minutes').val() >= 15 && newData.child('extra_minutes').val() <= 480 && newData.child('until_ms').isNumber() && newData.child('until_ms').val() >= now && newData.child('until_ms').val() <= now + 2592000000",
+        ".validate": "newData.hasChildren(['by', 'at', 'extra_minutes', 'until_ms']) && newData.child('by').isString() && newData.child('by').val().length <= 80 && newData.child('at').isString() && newData.child('at').val().length <= 40 && newData.child('extra_minutes').isNumber() && newData.child('extra_minutes').val() >= 15 && newData.child('extra_minutes').val() <= 480 && newData.child('until_ms').isNumber() && newData.child('until_ms').val() >= now && newData.child('until_ms').val() <= now + 86400000",
         "$other": {
           ".validate": false
         }

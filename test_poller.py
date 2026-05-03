@@ -69,6 +69,49 @@ class PollerSessionTests(TestCase):
         self.assertEqual(cleared, ["123-1"])
         self.assertNotIn("port_sessions", stations["123"])
 
+    def test_policy_deadline_ignores_far_future_public_extension(self):
+        started = "2026-05-03T10:00:00+00:00"
+        now_ms = int(
+            datetime(2026, 5, 3, 13, 0, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        malicious_until = int(
+            datetime(2099, 1, 1, tzinfo=timezone.utc).timestamp() * 1000
+        )
+
+        deadline = poller._policy_deadline_ms(
+            "123",
+            "1",
+            started,
+            120,
+            {"123-1": {"until_ms": malicious_until}},
+            now_ms,
+        )
+
+        self.assertEqual(
+            deadline,
+            int(datetime(2026, 5, 3, 12, 0, tzinfo=timezone.utc).timestamp() * 1000),
+        )
+
+    def test_policy_deadline_accepts_bounded_public_extension(self):
+        started = "2026-05-03T10:00:00+00:00"
+        now_ms = int(
+            datetime(2026, 5, 3, 11, 0, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        extension_until = int(
+            datetime(2026, 5, 3, 14, 0, tzinfo=timezone.utc).timestamp() * 1000
+        )
+
+        deadline = poller._policy_deadline_ms(
+            "123",
+            "1",
+            started,
+            120,
+            {"123-1": {"until_ms": extension_until}},
+            now_ms,
+        )
+
+        self.assertEqual(deadline, extension_until)
+
 
 if __name__ == "__main__":
     main()

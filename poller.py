@@ -164,6 +164,28 @@ def _trusted_reset_started_at(reset: Any, current_started_at: str, now_ms: int) 
     return datetime.fromtimestamp(reset_ms_int / 1000, tz=timezone.utc).isoformat()
 
 
+def _trusted_extension_until_ms(ext: Any, base_deadline_ms: int, now_ms: int) -> int | None:
+    """Return a bounded extension deadline from public client metadata."""
+    if not isinstance(ext, dict):
+        return None
+
+    until_ms = ext.get("until_ms")
+    if not isinstance(until_ms, (int, float)):
+        return None
+
+    until_ms_int = int(until_ms)
+    if until_ms_int <= 0:
+        return None
+
+    # Browser writes are intentionally unauthenticated for kiosk use, so cap how
+    # far a client-provided extension can defer the move-car policy.
+    max_deadline_ms = max(base_deadline_ms, now_ms) + 8 * 60 * 60 * 1000
+    if until_ms_int > max_deadline_ms:
+        return None
+
+    return until_ms_int
+
+
 def _current_utc_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -247,6 +269,7 @@ def _policy_deadline_ms(
     started_at: str,
     limit_minutes: int,
     ext_map: Dict[str, Any],
+    now_ms: int | None = None,
 ) -> int:
     start_ms = _iso_to_utc_ms(started_at)
     if start_ms <= 0:
@@ -254,10 +277,11 @@ def _policy_deadline_ms(
     base = start_ms + limit_minutes * 60 * 1000
     slot_key = f"{sid}-{pk_s}"
     ext = ext_map.get(slot_key) if isinstance(ext_map, dict) else None
-    if isinstance(ext, dict):
-        um = ext.get("until_ms")
-        if isinstance(um, (int, float)) and um > 0:
-            return int(um)
+    trusted_ext = _trusted_extension_until_ms(
+        ext, base, _current_utc_ms() if now_ms is None else now_ms
+    )
+    if trusted_ext is not None:
+        return trusted_ext
     return base
 
 
@@ -301,7 +325,7 @@ def enrich_policy_complete_since(
             if _session_occupancy_bucket(label_s) != "occupied":
                 continue
             deadline = _policy_deadline_ms(
-                str(sid), str(pk_s), str(started), limit_minutes, ext_map
+                str(sid), str(pk_s), str(started), limit_minutes, ext_map, now_ms
             )
             if deadline <= 0:
                 continue
