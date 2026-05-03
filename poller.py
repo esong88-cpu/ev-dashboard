@@ -142,6 +142,32 @@ def _session_occupancy_bucket(label: str) -> str:
     return "occupied"
 
 
+def _trusted_reset_started_at(reset: Any, current_started_at: str, now_ms: int) -> str | None:
+    """Return a sanitized reset timestamp if it can safely replace started_at."""
+    if not isinstance(reset, dict):
+        return None
+
+    reset_ms = reset.get("at_ms")
+    if not isinstance(reset_ms, (int, float)):
+        return None
+
+    reset_ms_int = int(reset_ms)
+    current_ms = _iso_to_utc_ms(current_started_at)
+    if reset_ms_int <= current_ms:
+        return None
+
+    # Reset writes come from public clients. Do not let malformed/future values
+    # poison canonical session clocks or delay policy-complete state indefinitely.
+    if reset_ms_int > now_ms + 5 * 60 * 1000:
+        return None
+
+    return datetime.fromtimestamp(reset_ms_int / 1000, tz=timezone.utc).isoformat()
+
+
+def _current_utc_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
 def enrich_stations_with_port_sessions(
     prev_root: Dict[str, Any], stations: Dict[str, Any], reset_map: Dict[str, Any]
 ) -> List[str]:
@@ -156,6 +182,7 @@ def enrich_stations_with_port_sessions(
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
     now_iso = datetime.now(timezone.utc).isoformat()
+    now_ms = _current_utc_ms()
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -190,13 +217,9 @@ def enrich_stations_with_port_sessions(
                 started_at = old_start
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
-            if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+            reset_started_at = _trusted_reset_started_at(reset, started_at, now_ms)
+            if reset_started_at:
+                started_at = reset_started_at
 
             new_sess[pk_s] = {"started_at": started_at}
 
