@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -147,7 +148,8 @@ def enrich_stations_with_port_sessions(
 ) -> List[str]:
     """
     Attach port_sessions.started_at per port when occupied; clear when available.
-    Returns /slot_extensions keys (deviceId-portId) to delete when a port frees up.
+    Returns per-slot metadata keys (deviceId-portId) to delete when a port frees
+    up or when a manual reset starts a new timing window.
     """
     prev_root = prev_root or {}
     prev_stations: Dict[str, Any] = {
@@ -189,14 +191,14 @@ def enrich_stations_with_port_sessions(
             else:
                 started_at = old_start
 
-            reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
+            slot_key = f"{sid}-{pk_s}"
+            reset = reset_map.get(slot_key) if isinstance(reset_map, dict) else None
             if isinstance(reset, dict):
                 reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+                reset_iso = _epoch_ms_to_utc_iso(reset_ms)
+                if reset_iso is not None and int(reset_ms) > _iso_to_utc_ms(started_at):
+                    started_at = reset_iso
+                    ext_clear.append(slot_key)
 
             new_sess[pk_s] = {"started_at": started_at}
 
@@ -212,10 +214,27 @@ def _iso_to_utc_ms(iso: str) -> int:
     if not iso:
         return 0
     s = str(iso).strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return 0
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
+
+
+def _epoch_ms_to_utc_iso(ms: Any) -> str | None:
+    if (
+        isinstance(ms, bool)
+        or not isinstance(ms, (int, float))
+        or not math.isfinite(ms)
+        or ms <= 0
+    ):
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def _policy_deadline_ms(
@@ -473,6 +492,8 @@ def main() -> None:
     ext_map = db.reference("/slot_extensions").get() or {}
     if not isinstance(ext_map, dict):
         ext_map = {}
+    for key in cleared_ext_keys:
+        ext_map.pop(key, None)
     enrich_policy_complete_since(prev_root, payload, ext_map, charging_limit_minutes)
 
     last_updated = datetime.now(timezone.utc).isoformat()

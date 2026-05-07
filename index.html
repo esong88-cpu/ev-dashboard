@@ -118,7 +118,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-        import { getDatabase, ref, onValue, set } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+        import { getDatabase, ref, onValue, set, update } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyCMLfdk0kPpl3g_BjVkuUOLlivS25jZAQw",
@@ -645,15 +645,17 @@
                 const ok = confirm("Reset this spot's timer because a new car just parked here?");
                 if (!ok) return;
                 const now = Date.now();
-                set(ref(db, `slot_resets/${key}`), {
-                    at: new Date(now).toISOString(),
-                    at_ms: now,
+                update(ref(db), {
+                    [`slot_resets/${key}`]: {
+                        at: new Date(now).toISOString(),
+                        at_ms: now,
+                    },
+                    [`slot_extensions/${key}`]: null,
                 })
-                    .then(() => set(ref(db, `slot_extensions/${key}`), null))
                     .catch((err) => {
                         console.error(err);
                         alert(
-                            "Could not reset timer. In Firebase Realtime Database rules, allow read/write for /slot_resets."
+                            "Could not reset timer. In Firebase Realtime Database rules, allow read/write for /slot_resets and /slot_extensions."
                         );
                     });
                 return;
