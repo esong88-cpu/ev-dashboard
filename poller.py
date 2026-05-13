@@ -33,10 +33,16 @@ logger = logging.getLogger(__name__)
 
 def _parse_station_ids(raw: str) -> List[int]:
     ids: List[int] = []
-    for part in raw.replace(" ", "").split(","):
+    for part in raw.split(","):
+        part = part.strip()
         if not part:
             continue
-        ids.append(int(part))
+        try:
+            ids.append(int(part))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid station ID {part!r} in CHARGEPOINT_STATION_IDS."
+            ) from exc
     return ids
 
 
@@ -428,7 +434,14 @@ def main() -> None:
         logger.error("Set CHARGEPOINT_STATION_IDS (comma-separated device IDs).")
         sys.exit(1)
 
-    station_ids = _parse_station_ids(station_raw)
+    try:
+        station_ids = _parse_station_ids(station_raw)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+    if not station_ids:
+        logger.error("CHARGEPOINT_STATION_IDS must contain at least one numeric device ID.")
+        sys.exit(1)
     init_firebase(database_url)
 
     logger.info("Logging in to ChargePoint…")
