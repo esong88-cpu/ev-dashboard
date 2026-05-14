@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_FUTURE_SKEW_MS = 10 * 60 * 1000;
+        const MAX_EXTENSION_AHEAD_MS = 24 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,12 +277,21 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function validFutureBoundedMs(value, now, maxAheadMs) {
+            return (
+                typeof value === "number" &&
+                Number.isFinite(value) &&
+                value > 0 &&
+                value <= now + maxAheadMs
+            );
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && validFutureBoundedMs(ext.until_ms, now, MAX_EXTENSION_AHEAD_MS)) return ext.until_ms;
             return base;
         }
 
@@ -288,7 +299,7 @@
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
             if (cp === "available") return "available";
-            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            const deadline = policyDeadlineMs(row, limitMin, extMap, now);
             if (deadline == null) return cp;
             if (now >= deadline) return "complete";
             if (cp === "charging" || cp === "complete") return "charging";
@@ -308,15 +319,16 @@
                         : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    validFutureBoundedMs(resetMs, now, RESET_FUTURE_SKEW_MS) &&
+                    (!Number.isFinite(startMs) || resetMs > startMs)
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
@@ -704,8 +716,12 @@
             }
             const base = start + row.limitMin * 60 * 1000;
             const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const now = Date.now();
+            const prevUntil = validFutureBoundedMs(prev.until_ms, now, MAX_EXTENSION_AHEAD_MS)
+                ? prev.until_ms
+                : 0;
+            const anchor = prevUntil > 0 ? prevUntil : base;
+            const newUntil = Math.max(anchor, now) + extra * 60 * 1000;
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,

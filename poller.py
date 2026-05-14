@@ -30,6 +30,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+RESET_FUTURE_SKEW_MS = 10 * 60 * 1000
+MAX_EXTENSION_AHEAD_MS = 24 * 60 * 60 * 1000
+
 
 def _parse_station_ids(raw: str) -> List[int]:
     ids: List[int] = []
@@ -155,7 +158,9 @@ def enrich_stations_with_port_sessions(
         for k, v in prev_root.items()
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    now_ms = int(now.timestamp() * 1000)
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -191,10 +196,11 @@ def enrich_stations_with_port_sessions(
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
             if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
+                reset_ms = _valid_future_bounded_ms(
+                    reset.get("at_ms"), now_ms, RESET_FUTURE_SKEW_MS
+                )
+                if reset_ms is not None and reset_ms > _iso_to_utc_ms(started_at):
+                    started_at = datetime.fromtimestamp(
                         reset_ms / 1000, tz=timezone.utc
                     ).isoformat()
 
@@ -218,6 +224,15 @@ def _iso_to_utc_ms(iso: str) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def _valid_future_bounded_ms(value: Any, now_ms: int, max_ahead_ms: int) -> int | None:
+    if not isinstance(value, (int, float)):
+        return None
+    value_int = int(value)
+    if value_int <= 0 or value_int > now_ms + max_ahead_ms:
+        return None
+    return value_int
+
+
 def _policy_deadline_ms(
     sid: str,
     pk_s: str,
@@ -225,6 +240,7 @@ def _policy_deadline_ms(
     limit_minutes: int,
     ext_map: Dict[str, Any],
 ) -> int:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = _iso_to_utc_ms(started_at)
     if start_ms <= 0:
         return 0
@@ -232,9 +248,9 @@ def _policy_deadline_ms(
     slot_key = f"{sid}-{pk_s}"
     ext = ext_map.get(slot_key) if isinstance(ext_map, dict) else None
     if isinstance(ext, dict):
-        um = ext.get("until_ms")
-        if isinstance(um, (int, float)) and um > 0:
-            return int(um)
+        um = _valid_future_bounded_ms(ext.get("until_ms"), now_ms, MAX_EXTENSION_AHEAD_MS)
+        if um is not None:
+            return um
     return base
 
 
