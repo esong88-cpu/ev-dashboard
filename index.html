@@ -160,6 +160,7 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_FUTURE_SKEW_MS = 10 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -308,8 +309,10 @@
                         : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    Number.isFinite(resetMs) &&
+                    resetMs <= now + RESET_FUTURE_SKEW_MS &&
+                    (!Number.isFinite(startMs) || resetMs > startMs)
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
