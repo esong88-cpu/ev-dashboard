@@ -207,6 +207,14 @@
 
         const META_KEYS = new Set(["last_updated", "charging_limit_minutes"]);
 
+        function rtdbMap(value) {
+            if (!value || typeof value !== "object") return {};
+            if (Array.isArray(value)) {
+                return Object.fromEntries(value.map((v, i) => [String(i), v]).filter(([, v]) => v != null));
+            }
+            return Object.fromEntries(Object.entries(value).map(([k, v]) => [String(k), v]));
+        }
+
         /** Rows in stable order (device id, port) — no status sort (for fixed parking stalls). */
         function flattenPortsStable(stations) {
             const rows = [];
@@ -215,10 +223,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = rtdbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = rtdbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
