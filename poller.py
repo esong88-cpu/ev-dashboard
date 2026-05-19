@@ -407,6 +407,38 @@ def poll_once(client: ChargePoint, station_ids: List[int], home_ids: set) -> Dic
     return stations
 
 
+def preserve_failed_station_payloads(
+    prev_root: Dict[str, Any], stations: Dict[str, Any]
+) -> None:
+    """
+    Keep the last good station shape when a single ChargePoint fetch fails.
+
+    The poller writes /stations with set(), so replacing a station with only an
+    error object would delete its port_sessions and reset timers on recovery.
+    """
+    prev_root = prev_root or {}
+    for sid, entry in list(stations.items()):
+        if not isinstance(entry, dict) or not entry.get("error"):
+            continue
+
+        prev_entry = prev_root.get(sid)
+        if not isinstance(prev_entry, dict) or prev_entry.get("error"):
+            continue
+
+        prev_ports = _rtdb_map(prev_entry.get("ports"))
+        if not prev_ports:
+            continue
+
+        stations[sid] = {
+            **prev_entry,
+            "ports": prev_ports,
+            "port_sessions": _rtdb_map(prev_entry.get("port_sessions")),
+            "fetch_error": entry.get("error"),
+            "stale": True,
+            "updated_at": entry.get("updated_at"),
+        }
+
+
 def main() -> None:
     # GitHub Actions / secrets (primary)
     username = (os.getenv("CHARGEPOINT_USER") or "").strip()
@@ -460,6 +492,7 @@ def main() -> None:
     ref = db.reference("/stations")
     prev_root = ref.get() or {}
     payload = poll_once(client, station_ids, home_ids)
+    preserve_failed_station_payloads(prev_root, payload)
     reset_map = db.reference("/slot_resets").get() or {}
     if not isinstance(reset_map, dict):
         reset_map = {}
