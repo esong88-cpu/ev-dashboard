@@ -134,6 +134,43 @@ def _rtdb_map(obj: Any) -> Dict[str, Any]:
     return {}
 
 
+def preserve_previous_station_on_errors(
+    prev_root: Dict[str, Any], stations: Dict[str, Any]
+) -> None:
+    """
+    Keep the last known station state when a single ChargePoint fetch fails.
+
+    The dashboard skips entries with "error"; replacing a healthy station with an
+    error-only object would also drop port_sessions and restart policy timers on
+    the next successful poll.
+    """
+    prev_root = prev_root or {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for sid, entry in list(stations.items()):
+        if not isinstance(entry, dict) or not entry.get("error"):
+            continue
+
+        prev_entry = prev_root.get(sid)
+        if not isinstance(prev_entry, dict) or prev_entry.get("error"):
+            continue
+        if not (
+            prev_entry.get("ports")
+            or prev_entry.get("station_status")
+            or prev_entry.get("name")
+        ):
+            continue
+
+        preserved = dict(prev_entry)
+        if "ports" in preserved:
+            preserved["ports"] = _rtdb_map(preserved.get("ports"))
+        if "port_sessions" in preserved:
+            preserved["port_sessions"] = _rtdb_map(preserved.get("port_sessions"))
+        preserved.pop("error", None)
+        preserved["last_fetch_error"] = str(entry.get("error") or "unknown error")
+        preserved["last_fetch_error_at"] = str(entry.get("updated_at") or now_iso)
+        stations[sid] = preserved
+
+
 def _session_occupancy_bucket(label: str) -> str:
     """available vs still plugged / in use (charging or CP-reported complete)."""
     n = (label or "").strip().lower()
@@ -460,6 +497,7 @@ def main() -> None:
     ref = db.reference("/stations")
     prev_root = ref.get() or {}
     payload = poll_once(client, station_ids, home_ids)
+    preserve_previous_station_on_errors(prev_root, payload)
     reset_map = db.reference("/slot_resets").get() or {}
     if not isinstance(reset_map, dict):
         reset_map = {}
