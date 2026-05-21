@@ -160,6 +160,7 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MAX_EXTENSION_MINUTES = 480;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -207,6 +208,28 @@
 
         const META_KEYS = new Set(["last_updated", "charging_limit_minutes"]);
 
+        function rtdbMap(value) {
+            if (!value || typeof value !== "object") return {};
+            if (Array.isArray(value)) {
+                const out = {};
+                value.forEach((v, i) => {
+                    if (v !== null && v !== undefined) out[String(i)] = v;
+                });
+                return out;
+            }
+            return Object.fromEntries(Object.entries(value).map(([k, v]) => [String(k), v]));
+        }
+
+        function hasStationFetchErrors(stations) {
+            for (const [id, entry] of Object.entries(stations || {})) {
+                if (META_KEYS.has(id)) continue;
+                if (entry && typeof entry === "object" && (entry.error || entry.last_fetch_error)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /** Rows in stable order (device id, port) — no status sort (for fixed parking stalls). */
         function flattenPortsStable(stations) {
             const rows = [];
@@ -215,10 +238,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = rtdbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = rtdbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -279,8 +301,11 @@
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
+            const maxDeadline = base + MAX_EXTENSION_MINUTES * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) {
+                return Math.min(ext.until_ms, maxDeadline);
+            }
             return base;
         }
 
@@ -309,7 +334,7 @@
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
                     Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
@@ -534,9 +559,15 @@
             });
             const relative = formatPollAge(age);
             const detail = `last polled ${relative} (${clockStr})`;
+            const degraded = hasStationFetchErrors(lastStationPayload);
             if (age <= FRESH_MS) {
-                liveDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0";
-                liveLabel.textContent = `Online · ${detail}`;
+                if (degraded) {
+                    liveDot.className = "w-2.5 h-2.5 rounded-full bg-samtec-orange shrink-0";
+                    liveLabel.textContent = `Degraded · ${detail} · some station data stale`;
+                } else {
+                    liveDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0";
+                    liveLabel.textContent = `Online · ${detail}`;
+                }
             } else if (age <= OFFLINE_MS) {
                 liveDot.className = "w-2.5 h-2.5 rounded-full bg-samtec-orange shrink-0";
                 liveLabel.textContent = `Delayed · ${detail}`;
@@ -589,8 +620,8 @@
                 return;
             }
             lastPollerIso = data.last_updated ?? null;
-            const ext = lastExtMap && typeof lastExtMap === "object" ? lastExtMap : {};
-            const resets = lastResetMap && typeof lastResetMap === "object" ? lastResetMap : {};
+            const ext = rtdbMap(lastExtMap);
+            const resets = rtdbMap(lastResetMap);
             const now = Date.now();
             const annotatedStable = annotateRows(data, ext, resets, now);
             const slots = stallSlotsFromRows(annotatedStable);
