@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_FUTURE_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_MS = 8 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -176,6 +178,18 @@
             if (s === "charging") return "charging";
             if (s === "complete") return "complete";
             return "other";
+        }
+
+        function rtdbMap(obj) {
+            if (!obj || typeof obj !== "object") return {};
+            if (Array.isArray(obj)) {
+                const out = {};
+                obj.forEach((value, idx) => {
+                    if (value !== null && value !== undefined) out[String(idx)] = value;
+                });
+                return out;
+            }
+            return obj;
         }
 
         function formatDuration(ms) {
@@ -215,10 +229,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = rtdbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = rtdbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -275,12 +288,33 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function trustedExtensionUntilMs(ext, baseDeadlineMs, now) {
+            if (!ext || typeof ext !== "object") return null;
+            const until = ext.until_ms;
+            if (typeof until !== "number" || !Number.isFinite(until)) return null;
+            if (until < baseDeadlineMs) return null;
+            const maxDeadline = Math.max(baseDeadlineMs, now) + MAX_EXTENSION_MS;
+            if (until > maxDeadline) return null;
+            return until;
+        }
+
+        function trustedResetMs(reset, currentStartMs, now) {
+            if (!reset || typeof reset !== "object") return NaN;
+            const raw = reset.at_ms;
+            if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return NaN;
+            if (raw > now + RESET_FUTURE_SKEW_MS) return NaN;
+            const bounded = Math.min(raw, now);
+            if (Number.isFinite(currentStartMs) && bounded <= currentStartMs) return NaN;
+            return bounded;
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            const trustedExt = trustedExtensionUntilMs(ext, base, now);
+            if (trustedExt !== null) return trustedExt;
             return base;
         }
 
@@ -288,7 +322,7 @@
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
             if (cp === "available") return "available";
-            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            const deadline = policyDeadlineMs(row, limitMin, extMap, now);
             if (deadline == null) return cp;
             if (now >= deadline) return "complete";
             if (cp === "charging" || cp === "complete") return "charging";
@@ -302,21 +336,16 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
+                const resetMs = trustedResetMs(reset, startMs, now);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
-                        : r.sessionStartedAt;
+                    Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
@@ -404,9 +433,11 @@
                             ? `<div class="text-[10px] text-stone-500 text-center mt-1 leading-tight">ChargePoint: session complete · co-op timer still running</div>`
                             : "";
                     const idleHint = bucket === "available" ? "No vehicle" : "";
-                    const resetButton = `<button type="button" data-reset-key="${escAttr(
-                        r.key
-                    )}" class="absolute top-0 left-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-600 text-stone-400 hover:border-sky-400 hover:text-sky-300 bg-black/60">Reset</button>`;
+                    const resetButton = isOverdue
+                        ? ""
+                        : `<button type="button" data-reset-key="${escAttr(
+                              r.key
+                          )}" class="absolute top-0 left-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-stone-600 text-stone-400 hover:border-sky-400 hover:text-sky-300 bg-black/60">Reset</button>`;
                     const statusButton = isOverdue
                         ? `<div class="absolute top-0 right-0 z-10 text-[10px] uppercase tracking-wide px-2 py-0.5 rounded border border-red-500 text-red-300 bg-black/70">Move</div>`
                         : `<button type="button" data-extend-key="${escAttr(
@@ -703,9 +734,10 @@
                 return;
             }
             const base = start + row.limitMin * 60 * 1000;
-            const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const now = Date.now();
+            const anchor = Math.max(row.deadlineMs || base, base);
+            const maxUntil = Math.max(base, now) + MAX_EXTENSION_MS;
+            const newUntil = Math.min(Math.max(anchor, now) + extra * 60 * 1000, maxUntil);
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
