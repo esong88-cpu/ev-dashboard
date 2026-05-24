@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -30,6 +31,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+META_KEYS = {"last_updated", "charging_limit_minutes"}
+
 
 def _parse_station_ids(raw: str) -> List[int]:
     ids: List[int] = []
@@ -37,6 +40,15 @@ def _parse_station_ids(raw: str) -> List[int]:
         if not part:
             continue
         ids.append(int(part))
+    return ids
+
+
+def _parse_required_station_ids(raw: str) -> List[int]:
+    if not raw:
+        raise ValueError("CHARGEPOINT_STATION_IDS is required")
+    ids = _parse_station_ids(raw)
+    if not ids:
+        raise ValueError("CHARGEPOINT_STATION_IDS must contain at least one device ID")
     return ids
 
 
@@ -134,6 +146,14 @@ def _rtdb_map(obj: Any) -> Dict[str, Any]:
     return {}
 
 
+def _station_entries(root: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        str(k): v
+        for k, v in (root or {}).items()
+        if k not in META_KEYS and isinstance(v, dict)
+    }
+
+
 def _session_occupancy_bucket(label: str) -> str:
     """available vs still plugged / in use (charging or CP-reported complete)."""
     n = (label or "").strip().lower()
@@ -150,11 +170,7 @@ def enrich_stations_with_port_sessions(
     Returns /slot_extensions keys (deviceId-portId) to delete when a port frees up.
     """
     prev_root = prev_root or {}
-    prev_stations: Dict[str, Any] = {
-        k: v
-        for k, v in prev_root.items()
-        if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
-    }
+    prev_stations: Dict[str, Any] = _station_entries(prev_root)
     now_iso = datetime.now(timezone.utc).isoformat()
     ext_clear: List[str] = []
 
@@ -193,10 +209,16 @@ def enrich_stations_with_port_sessions(
             if isinstance(reset, dict):
                 reset_ms = reset.get("at_ms")
                 reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+                if (
+                    isinstance(reset_ms, (int, float))
+                    and math.isfinite(reset_ms)
+                    and reset_ms > _iso_to_utc_ms(started_at)
+                ):
+                    started_at = (
+                        reset_iso
+                        if _iso_to_utc_ms(reset_iso) > 0
+                        else datetime.fromtimestamp(reset_ms / 1000, tz=timezone.utc).isoformat()
+                    )
 
             new_sess[pk_s] = {"started_at": started_at}
 
@@ -212,7 +234,10 @@ def _iso_to_utc_ms(iso: str) -> int:
     if not iso:
         return 0
     s = str(iso).strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return 0
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
@@ -249,11 +274,7 @@ def enrich_policy_complete_since(
     deadline is passed while still occupied; clear when back inside the window.
     Survives page reloads for “Complete · Xm” display.
     """
-    prev_stations: Dict[str, Any] = {
-        k: v
-        for k, v in (prev_root or {}).items()
-        if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
-    }
+    prev_stations: Dict[str, Any] = _station_entries(prev_root)
     now_iso = datetime.now(timezone.utc).isoformat()
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -407,6 +428,40 @@ def poll_once(client: ChargePoint, station_ids: List[int], home_ids: set) -> Dic
     return stations
 
 
+def preserve_previous_station_state(
+    prev_root: Dict[str, Any], stations: Dict[str, Any]
+) -> None:
+    """
+    Avoid replacing a known-good station subtree with an error-only or empty-port
+    payload during a transient ChargePoint/API failure.
+    """
+    prev_stations = _station_entries(prev_root)
+    for sid, entry in list(stations.items()):
+        if not isinstance(entry, dict):
+            continue
+
+        has_error = bool(entry.get("error"))
+        has_ports = bool(_rtdb_map(entry.get("ports")))
+        if not has_error and has_ports:
+            continue
+
+        prev_entry = prev_stations.get(str(sid))
+        if not isinstance(prev_entry, dict) or not _rtdb_map(prev_entry.get("ports")):
+            continue
+
+        failed_at = str(entry.get("updated_at") or datetime.now(timezone.utc).isoformat())
+        if has_error:
+            reason = str(entry.get("error") or "Station fetch failed")
+        else:
+            reason = "Station payload contained no ports"
+
+        restored = dict(prev_entry)
+        restored["last_fetch_error"] = reason
+        restored["last_fetch_failed_at"] = failed_at
+        stations[str(sid)] = restored
+        logger.warning("Preserved previous state for station %s: %s", sid, reason)
+
+
 def main() -> None:
     # GitHub Actions / secrets (primary)
     username = (os.getenv("CHARGEPOINT_USER") or "").strip()
@@ -424,11 +479,11 @@ def main() -> None:
             "(session cookie if you use SSO / 2FA)."
         )
         sys.exit(1)
-    if not station_raw:
-        logger.error("Set CHARGEPOINT_STATION_IDS (comma-separated device IDs).")
+    try:
+        station_ids = _parse_required_station_ids(station_raw)
+    except ValueError as exc:
+        logger.error("%s", exc)
         sys.exit(1)
-
-    station_ids = _parse_station_ids(station_raw)
     init_firebase(database_url)
 
     logger.info("Logging in to ChargePoint…")
@@ -460,6 +515,7 @@ def main() -> None:
     ref = db.reference("/stations")
     prev_root = ref.get() or {}
     payload = poll_once(client, station_ids, home_ids)
+    preserve_previous_station_state(prev_root, payload)
     reset_map = db.reference("/slot_resets").get() or {}
     if not isinstance(reset_map, dict):
         reset_map = {}
