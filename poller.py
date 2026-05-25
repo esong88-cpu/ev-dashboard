@@ -30,6 +30,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+RESET_FUTURE_SKEW_MS = 5 * 60 * 1000
+
 
 def _parse_station_ids(raw: str) -> List[int]:
     ids: List[int] = []
@@ -156,6 +158,7 @@ def enrich_stations_with_port_sessions(
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
     now_iso = datetime.now(timezone.utc).isoformat()
+    now_ms = _iso_to_utc_ms(now_iso)
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -190,13 +193,7 @@ def enrich_stations_with_port_sessions(
                 started_at = old_start
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
-            if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+            started_at = _apply_reset_to_started_at(reset, started_at, now_ms)
 
             new_sess[pk_s] = {"started_at": started_at}
 
@@ -216,6 +213,33 @@ def _iso_to_utc_ms(iso: str) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
+
+
+def _apply_reset_to_started_at(reset: Any, started_at: str, now_ms: int) -> str:
+    """
+    /slot_resets is browser-writable metadata, so only trust a sane numeric
+    timestamp and derive the stored ISO string from it.
+    """
+    if not isinstance(reset, dict):
+        return started_at
+
+    reset_ms = reset.get("at_ms")
+    if not isinstance(reset_ms, (int, float)) or reset_ms <= 0:
+        return started_at
+
+    reset_ms = int(reset_ms)
+    if reset_ms > now_ms + RESET_FUTURE_SKEW_MS:
+        return started_at
+
+    try:
+        current_ms = _iso_to_utc_ms(started_at)
+    except (TypeError, ValueError, OverflowError):
+        current_ms = 0
+
+    if reset_ms <= current_ms:
+        return started_at
+
+    return datetime.fromtimestamp(reset_ms / 1000, tz=timezone.utc).isoformat()
 
 
 def _policy_deadline_ms(
