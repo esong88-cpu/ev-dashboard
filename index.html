@@ -160,6 +160,7 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -207,6 +208,18 @@
 
         const META_KEYS = new Set(["last_updated", "charging_limit_minutes"]);
 
+        function rtdbMap(obj) {
+            if (!obj || typeof obj !== "object") return {};
+            if (Array.isArray(obj)) {
+                const out = {};
+                obj.forEach((v, i) => {
+                    if (v !== null && v !== undefined) out[String(i)] = v;
+                });
+                return out;
+            }
+            return Object.fromEntries(Object.entries(obj).map(([k, v]) => [String(k), v]));
+        }
+
         /** Rows in stable order (device id, port) — no status sort (for fixed parking stalls). */
         function flattenPortsStable(stations) {
             const rows = [];
@@ -215,10 +228,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = rtdbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = rtdbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -284,6 +296,13 @@
             return base;
         }
 
+        function validResetMs(reset, now) {
+            if (!reset || typeof reset !== "object") return NaN;
+            if (typeof reset.at_ms !== "number" || !Number.isFinite(reset.at_ms)) return NaN;
+            if (reset.at_ms <= 0 || reset.at_ms > now + RESET_CLOCK_SKEW_MS) return NaN;
+            return reset.at_ms;
+        }
+
         /** Lot + “complete” list use co-op policy; falls back to ChargePoint if no session clock yet. */
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
@@ -302,14 +321,11 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
+                const resetMs = validResetMs(reset, now);
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
                     Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
