@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -29,6 +30,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logger = logging.getLogger(__name__)
+
+RESET_CLOCK_SKEW_MS = 5 * 60 * 1000
 
 
 def _parse_station_ids(raw: str) -> List[int]:
@@ -142,6 +145,57 @@ def _session_occupancy_bucket(label: str) -> str:
     return "occupied"
 
 
+def _valid_reset_ms(reset: Any, now_ms: int) -> int | None:
+    if not isinstance(reset, dict):
+        return None
+    raw = reset.get("at_ms")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if isinstance(raw, float) and not math.isfinite(raw):
+        return None
+    reset_ms = int(raw)
+    if reset_ms <= 0 or reset_ms > now_ms + RESET_CLOCK_SKEW_MS:
+        return None
+    return reset_ms
+
+
+def _station_has_ports(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    return bool(_rtdb_map(entry.get("ports")))
+
+
+def _carry_forward_failed_stations(
+    prev_root: Dict[str, Any], stations: Dict[str, Any]
+) -> int:
+    """
+    Keep the last good station snapshot if this poll could not fetch it.
+
+    A transient ChargePoint/API failure should not erase active session timers from
+    Firebase; the next successful poll will replace this stale snapshot.
+    """
+    prev_root = prev_root or {}
+    carried = 0
+    failed_at_fallback = datetime.now(timezone.utc).isoformat()
+
+    for sid, entry in list(stations.items()):
+        if not isinstance(entry, dict) or not entry.get("error"):
+            continue
+        prev_entry = prev_root.get(sid)
+        if not _station_has_ports(prev_entry):
+            continue
+
+        preserved = dict(prev_entry)
+        preserved.pop("error", None)
+        preserved["stale"] = True
+        preserved["poll_error"] = str(entry.get("error") or "unknown error")
+        preserved["poll_error_at"] = str(entry.get("updated_at") or failed_at_fallback)
+        stations[sid] = preserved
+        carried += 1
+
+    return carried
+
+
 def enrich_stations_with_port_sessions(
     prev_root: Dict[str, Any], stations: Dict[str, Any], reset_map: Dict[str, Any]
 ) -> List[str]:
@@ -155,7 +209,9 @@ def enrich_stations_with_port_sessions(
         for k, v in prev_root.items()
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    now_ms = int(now.timestamp() * 1000)
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -190,13 +246,11 @@ def enrich_stations_with_port_sessions(
                 started_at = old_start
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
-            if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+            reset_ms = _valid_reset_ms(reset, now_ms)
+            if reset_ms is not None and reset_ms > _iso_to_utc_ms(started_at):
+                started_at = datetime.fromtimestamp(
+                    reset_ms / 1000, tz=timezone.utc
+                ).isoformat()
 
             new_sess[pk_s] = {"started_at": started_at}
 
@@ -460,6 +514,13 @@ def main() -> None:
     ref = db.reference("/stations")
     prev_root = ref.get() or {}
     payload = poll_once(client, station_ids, home_ids)
+    had_successful_fetch = any(
+        not (isinstance(entry, dict) and entry.get("error"))
+        for entry in payload.values()
+    )
+    carried_count = _carry_forward_failed_stations(prev_root, payload)
+    if carried_count:
+        logger.warning("Carried forward %d stale station(s) after fetch failures.", carried_count)
     reset_map = db.reference("/slot_resets").get() or {}
     if not isinstance(reset_map, dict):
         reset_map = {}
@@ -475,7 +536,12 @@ def main() -> None:
         ext_map = {}
     enrich_policy_complete_since(prev_root, payload, ext_map, charging_limit_minutes)
 
-    last_updated = datetime.now(timezone.utc).isoformat()
+    poll_completed_at = datetime.now(timezone.utc).isoformat()
+    last_updated = (
+        poll_completed_at
+        if had_successful_fetch
+        else str(prev_root.get("last_updated") or poll_completed_at)
+    )
     root_payload: Dict[str, Any] = {
         "last_updated": last_updated,
         "charging_limit_minutes": charging_limit_minutes,
