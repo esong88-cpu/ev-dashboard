@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -29,6 +30,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logger = logging.getLogger(__name__)
+
+RESET_FUTURE_SKEW_MS = 5 * 60 * 1000
 
 
 def _parse_station_ids(raw: str) -> List[int]:
@@ -190,13 +193,7 @@ def enrich_stations_with_port_sessions(
                 started_at = old_start
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
-            if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+            started_at = _apply_valid_reset_started_at(reset, started_at)
 
             new_sess[pk_s] = {"started_at": started_at}
 
@@ -211,11 +208,37 @@ def enrich_stations_with_port_sessions(
 def _iso_to_utc_ms(iso: str) -> int:
     if not iso:
         return 0
-    s = str(iso).strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+    try:
+        s = str(iso).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _finite_epoch_ms(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return int(value)
+
+
+def _apply_valid_reset_started_at(reset: Any, started_at: str) -> str:
+    if not isinstance(reset, dict):
+        return started_at
+    reset_ms = _finite_epoch_ms(reset.get("at_ms"))
+    if reset_ms is None:
+        return started_at
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if reset_ms > now_ms + RESET_FUTURE_SKEW_MS:
+        return started_at
+    started_ms = _iso_to_utc_ms(started_at)
+    if started_ms > 0 and reset_ms <= started_ms:
+        return started_at
+    return datetime.fromtimestamp(reset_ms / 1000, tz=timezone.utc).isoformat()
 
 
 def _policy_deadline_ms(

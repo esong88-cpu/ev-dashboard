@@ -160,6 +160,7 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_FUTURE_SKEW_MS = 5 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,6 +276,19 @@
             return NaN;
         }
 
+        function applyValidResetStartedAt(reset, startedAt, now) {
+            if (!reset || typeof reset !== "object") return startedAt;
+            const resetMs =
+                typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms) && reset.at_ms > 0
+                    ? reset.at_ms
+                    : NaN;
+            if (!Number.isFinite(resetMs)) return startedAt;
+            if (resetMs > now + RESET_FUTURE_SKEW_MS) return startedAt;
+            const startMs = parseIsoToMs(startedAt);
+            if (Number.isFinite(startMs) && resetMs <= startMs) return startedAt;
+            return new Date(resetMs).toISOString();
+        }
+
         function policyDeadlineMs(row, limitMin, extMap) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
@@ -302,15 +316,11 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
-                const startMs = parseIsoToMs(r.sessionStartedAt);
-                const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
-                        : r.sessionStartedAt;
+                const sessionStartedAt = applyValidResetStartedAt(
+                    reset,
+                    r.sessionStartedAt,
+                    now
+                );
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
