@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import firebase_admin
 from firebase_admin import credentials, db
@@ -29,6 +30,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logger = logging.getLogger(__name__)
+
+RESET_CLOCK_SKEW_MS = 10 * 60 * 1000
+MAX_EXTENSION_FUTURE_MS = 24 * 60 * 60 * 1000
 
 
 def _parse_station_ids(raw: str) -> List[int]:
@@ -142,6 +146,33 @@ def _session_occupancy_bucket(label: str) -> str:
     return "occupied"
 
 
+def _now_utc_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _finite_epoch_ms(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return int(value)
+    return None
+
+
+def _reset_ms_if_valid(reset: Any, started_at: str, now_ms: int) -> Optional[int]:
+    """Public reset metadata is untrusted; accept only near-current numeric ms."""
+    if not isinstance(reset, dict):
+        return None
+    reset_ms = _finite_epoch_ms(reset.get("at_ms"))
+    if reset_ms is None or reset_ms < 0:
+        return None
+    if reset_ms > now_ms + RESET_CLOCK_SKEW_MS:
+        return None
+    started_ms = _iso_to_utc_ms(started_at)
+    if started_ms > 0 and reset_ms <= started_ms:
+        return None
+    return reset_ms
+
+
 def enrich_stations_with_port_sessions(
     prev_root: Dict[str, Any], stations: Dict[str, Any], reset_map: Dict[str, Any]
 ) -> List[str]:
@@ -156,6 +187,7 @@ def enrich_stations_with_port_sessions(
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
     now_iso = datetime.now(timezone.utc).isoformat()
+    now_ms = _now_utc_ms()
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -187,16 +219,17 @@ def enrich_stations_with_port_sessions(
             if not was_occ or not old_start:
                 started_at = now_iso
             else:
-                started_at = old_start
+                started_at = str(old_start)
+                old_start_ms = _iso_to_utc_ms(started_at)
+                if old_start_ms <= 0 or old_start_ms > now_ms + RESET_CLOCK_SKEW_MS:
+                    started_at = now_iso
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
-            if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+            reset_ms = _reset_ms_if_valid(reset, started_at, now_ms)
+            if reset_ms is not None:
+                started_at = datetime.fromtimestamp(
+                    reset_ms / 1000, tz=timezone.utc
+                ).isoformat()
 
             new_sess[pk_s] = {"started_at": started_at}
 
@@ -211,11 +244,14 @@ def enrich_stations_with_port_sessions(
 def _iso_to_utc_ms(iso: str) -> int:
     if not iso:
         return 0
-    s = str(iso).strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+    try:
+        s = str(iso).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return 0
 
 
 def _policy_deadline_ms(
@@ -224,6 +260,7 @@ def _policy_deadline_ms(
     started_at: str,
     limit_minutes: int,
     ext_map: Dict[str, Any],
+    now_ms: Optional[int] = None,
 ) -> int:
     start_ms = _iso_to_utc_ms(started_at)
     if start_ms <= 0:
@@ -232,9 +269,11 @@ def _policy_deadline_ms(
     slot_key = f"{sid}-{pk_s}"
     ext = ext_map.get(slot_key) if isinstance(ext_map, dict) else None
     if isinstance(ext, dict):
-        um = ext.get("until_ms")
-        if isinstance(um, (int, float)) and um > 0:
-            return int(um)
+        um = _finite_epoch_ms(ext.get("until_ms"))
+        if um is not None and um > base:
+            now_ms = _now_utc_ms() if now_ms is None else now_ms
+            if um <= now_ms + MAX_EXTENSION_FUTURE_MS:
+                return um
     return base
 
 
@@ -278,7 +317,7 @@ def enrich_policy_complete_since(
             if _session_occupancy_bucket(label_s) != "occupied":
                 continue
             deadline = _policy_deadline_ms(
-                str(sid), str(pk_s), str(started), limit_minutes, ext_map
+                str(sid), str(pk_s), str(started), limit_minutes, ext_map, now_ms
             )
             if deadline <= 0:
                 continue
