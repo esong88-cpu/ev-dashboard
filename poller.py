@@ -134,6 +134,35 @@ def _rtdb_map(obj: Any) -> Dict[str, Any]:
     return {}
 
 
+def preserve_station_state_on_errors(
+    prev_root: Dict[str, Any], stations: Dict[str, Any]
+) -> None:
+    """
+    Keep durable per-port state when a station fetch fails.
+
+    The poller replaces /stations on each run. Without carrying this state
+    through an error payload, the next successful poll treats occupied ports as
+    brand-new sessions and resets co-op timers.
+    """
+    if not isinstance(stations, dict):
+        return
+    prev_stations: Dict[str, Any] = {
+        str(k): v
+        for k, v in (prev_root or {}).items()
+        if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
+    }
+
+    for sid, entry in stations.items():
+        if not isinstance(entry, dict) or not entry.get("error"):
+            continue
+        prev_entry = prev_stations.get(str(sid))
+        if not isinstance(prev_entry, dict):
+            continue
+        for key in ("ports", "port_sessions"):
+            if key in prev_entry and key not in entry:
+                entry[key] = prev_entry[key]
+
+
 def _session_occupancy_bucket(label: str) -> str:
     """available vs still plugged / in use (charging or CP-reported complete)."""
     n = (label or "").strip().lower()
@@ -460,6 +489,7 @@ def main() -> None:
     ref = db.reference("/stations")
     prev_root = ref.get() or {}
     payload = poll_once(client, station_ids, home_ids)
+    preserve_station_state_on_errors(prev_root, payload)
     reset_map = db.reference("/slot_resets").get() or {}
     if not isinstance(reset_map, dict):
         reset_map = {}
