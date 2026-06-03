@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_FUTURE_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_MS = 24 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,12 +277,25 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function trustedResetStartedAt(reset, currentStartedAt, now) {
+            if (!reset || typeof reset !== "object") return null;
+            const resetMs = typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms) ? reset.at_ms : NaN;
+            const startMs = parseIsoToMs(currentStartedAt);
+            if (!Number.isFinite(resetMs)) return null;
+            if (Number.isFinite(startMs) && resetMs <= startMs) return null;
+            if (resetMs > now + RESET_FUTURE_SKEW_MS) return null;
+            return new Date(resetMs).toISOString();
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) {
+                const maxDeadline = Math.max(base, now) + MAX_EXTENSION_MS;
+                if (ext.until_ms >= base && ext.until_ms <= maxDeadline) return ext.until_ms;
+            }
             return base;
         }
 
@@ -288,7 +303,7 @@
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
             if (cp === "available") return "available";
-            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            const deadline = policyDeadlineMs(row, limitMin, extMap, now);
             if (deadline == null) return cp;
             if (now >= deadline) return "complete";
             if (cp === "charging" || cp === "complete") return "charging";
@@ -302,21 +317,14 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
-                const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
-                        : r.sessionStartedAt;
+                    trustedResetStartedAt(reset, r.sessionStartedAt, now) || r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
@@ -703,8 +711,7 @@
                 return;
             }
             const base = start + row.limitMin * 60 * 1000;
-            const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
+            const anchor = policyDeadlineMs(row, row.limitMin, lastExtMap || {}, Date.now()) ?? base;
             const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
