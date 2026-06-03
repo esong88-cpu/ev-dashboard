@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import firebase_admin
 from firebase_admin import credentials, db
@@ -29,6 +30,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logger = logging.getLogger(__name__)
+
+RESET_FUTURE_SKEW_MS = 5 * 60 * 1000
+MAX_EXTENSION_MS = 24 * 60 * 60 * 1000
 
 
 def _parse_station_ids(raw: str) -> List[int]:
@@ -155,7 +159,9 @@ def enrich_stations_with_port_sessions(
         for k, v in prev_root.items()
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    now_ms = int(now.timestamp() * 1000)
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -184,19 +190,18 @@ def enrich_stations_with_port_sessions(
                 continue
 
             old_start = (prev_sess.get(pk_s) or {}).get("started_at")
-            if not was_occ or not old_start:
+            old_start_ms = _iso_to_utc_ms(str(old_start or ""))
+            if not was_occ or old_start_ms <= 0:
                 started_at = now_iso
             else:
-                started_at = old_start
+                started_at = str(old_start)
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
-            if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+            reset_started_at = _trusted_reset_started_at(
+                reset, _iso_to_utc_ms(started_at), now_ms
+            )
+            if reset_started_at:
+                started_at = reset_started_at
 
             new_sess[pk_s] = {"started_at": started_at}
 
@@ -212,10 +217,54 @@ def _iso_to_utc_ms(iso: str) -> int:
     if not iso:
         return 0
     s = str(iso).strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return 0
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+    try:
+        return int(dt.timestamp() * 1000)
+    except (OverflowError, OSError, ValueError):
+        return 0
+
+
+def _number_to_ms(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return int(value)
+    return 0
+
+
+def _trusted_reset_started_at(reset: Any, current_start_ms: int, now_ms: int) -> str:
+    if not isinstance(reset, dict):
+        return ""
+    reset_ms = _number_to_ms(reset.get("at_ms"))
+    if reset_ms <= current_start_ms:
+        return ""
+    if reset_ms > now_ms + RESET_FUTURE_SKEW_MS:
+        logger.warning("Ignoring reset timestamp too far in the future: %s", reset_ms)
+        return ""
+    try:
+        return datetime.fromtimestamp(reset_ms / 1000, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _trusted_extension_deadline(
+    ext: Any, base_deadline_ms: int, now_ms: int
+) -> Optional[int]:
+    if not isinstance(ext, dict):
+        return None
+    until_ms = _number_to_ms(ext.get("until_ms"))
+    if until_ms < base_deadline_ms:
+        return None
+    max_deadline_ms = max(base_deadline_ms, now_ms) + MAX_EXTENSION_MS
+    if until_ms > max_deadline_ms:
+        logger.warning("Ignoring extension timestamp too far in the future: %s", until_ms)
+        return None
+    return until_ms
 
 
 def _policy_deadline_ms(
@@ -224,6 +273,7 @@ def _policy_deadline_ms(
     started_at: str,
     limit_minutes: int,
     ext_map: Dict[str, Any],
+    now_ms: Optional[int] = None,
 ) -> int:
     start_ms = _iso_to_utc_ms(started_at)
     if start_ms <= 0:
@@ -231,10 +281,13 @@ def _policy_deadline_ms(
     base = start_ms + limit_minutes * 60 * 1000
     slot_key = f"{sid}-{pk_s}"
     ext = ext_map.get(slot_key) if isinstance(ext_map, dict) else None
-    if isinstance(ext, dict):
-        um = ext.get("until_ms")
-        if isinstance(um, (int, float)) and um > 0:
-            return int(um)
+    trusted_ext = _trusted_extension_deadline(
+        ext,
+        base,
+        now_ms if now_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000),
+    )
+    if trusted_ext is not None:
+        return trusted_ext
     return base
 
 
@@ -254,8 +307,9 @@ def enrich_policy_complete_since(
         for k, v in (prev_root or {}).items()
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
-    now_iso = datetime.now(timezone.utc).isoformat()
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    now_ms = int(now.timestamp() * 1000)
 
     for sid, entry in list(stations.items()):
         if not isinstance(entry, dict) or entry.get("error"):
@@ -278,7 +332,7 @@ def enrich_policy_complete_since(
             if _session_occupancy_bucket(label_s) != "occupied":
                 continue
             deadline = _policy_deadline_ms(
-                str(sid), str(pk_s), str(started), limit_minutes, ext_map
+                str(sid), str(pk_s), str(started), limit_minutes, ext_map, now_ms
             )
             if deadline <= 0:
                 continue
