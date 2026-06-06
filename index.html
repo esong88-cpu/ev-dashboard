@@ -160,6 +160,9 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const PUBLIC_CLOCK_SKEW_MS = 10 * 60 * 1000;
+        const MAX_EXTENSION_MINUTES = 480;
+        const MAX_EXTENSION_MS = MAX_EXTENSION_MINUTES * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,12 +278,23 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function finiteNumber(raw) {
+            return typeof raw === "number" && Number.isFinite(raw);
+        }
+
+        function validExtensionUntil(base, rawUntil, now = Date.now()) {
+            if (!finiteNumber(rawUntil)) return null;
+            const maxAllowed = Math.max(base, now) + MAX_EXTENSION_MS;
+            return rawUntil >= base && rawUntil <= maxAllowed ? rawUntil : null;
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            const until = ext ? validExtensionUntil(base, ext.until_ms, now) : null;
+            if (until != null) return until;
             return base;
         }
 
@@ -288,7 +302,7 @@
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
             if (cp === "available") return "available";
-            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            const deadline = policyDeadlineMs(row, limitMin, extMap, now);
             if (deadline == null) return cp;
             if (now >= deadline) return "complete";
             if (cp === "charging" || cp === "complete") return "charging";
@@ -303,20 +317,23 @@
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
                 const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
+                    reset && finiteNumber(reset.at_ms)
                         ? reset.at_ms
                         : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    Number.isFinite(resetMs) &&
+                    resetMs > 0 &&
+                    (!Number.isFinite(startMs) || resetMs > startMs) &&
+                    resetMs <= now + PUBLIC_CLOCK_SKEW_MS
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
@@ -704,8 +721,10 @@
             }
             const base = start + row.limitMin * 60 * 1000;
             const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const now = Date.now();
+            const prevUntil = validExtensionUntil(base, prev.until_ms, now);
+            const anchor = prevUntil != null ? prevUntil : base;
+            const newUntil = Math.max(anchor, now) + extra * 60 * 1000;
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
