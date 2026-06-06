@@ -50,8 +50,8 @@ import poller  # noqa: E402
 
 class PollerSessionHardeningTest(unittest.TestCase):
     def test_transient_fetch_error_preserves_previous_station_timers(self):
-        started_at = "2026-06-06T08:00:00+00:00"
-        complete_since = "2026-06-06T10:00:00+00:00"
+        started_at = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        complete_since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         prev_root = {
             "100": {
                 "device_id": 100,
@@ -74,6 +74,7 @@ class PollerSessionHardeningTest(unittest.TestCase):
 
         poller.preserve_previous_station_state_on_errors(prev_root, stations)
         cleared = poller.enrich_stations_with_port_sessions(prev_root, stations, {})
+        poller.enrich_policy_complete_since(prev_root, stations, {}, 120)
 
         self.assertEqual(cleared, [])
         self.assertNotIn("error", stations["100"])
