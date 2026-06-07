@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const CLIENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_WINDOW_MS = 24 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -176,6 +178,16 @@
             if (s === "charging") return "charging";
             if (s === "complete") return "complete";
             return "other";
+        }
+
+        function rtdbMap(obj) {
+            if (!obj || typeof obj !== "object") return {};
+            if (!Array.isArray(obj)) return obj;
+            const out = {};
+            obj.forEach((v, i) => {
+                if (v !== null && v !== undefined) out[String(i)] = v;
+            });
+            return out;
         }
 
         function formatDuration(ms) {
@@ -213,12 +225,11 @@
             for (const [id, entry] of Object.entries(stations || {})) {
                 if (META_KEYS.has(id)) continue;
                 if (!entry || typeof entry !== "object") continue;
-                if (entry.error) continue;
+                if (entry.error && !entry.ports) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = rtdbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = rtdbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -275,12 +286,14 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            const until = ext && typeof ext.until_ms === "number" ? ext.until_ms : NaN;
+            const maxUntil = Math.max(base, now) + MAX_EXTENSION_WINDOW_MS;
+            if (Number.isFinite(until) && until >= base && until <= maxUntil) return until;
             return base;
         }
 
@@ -288,7 +301,7 @@
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
             if (cp === "available") return "available";
-            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            const deadline = policyDeadlineMs(row, limitMin, extMap, now);
             if (deadline == null) return cp;
             if (now >= deadline) return "complete";
             if (cp === "charging" || cp === "complete") return "charging";
@@ -308,15 +321,17 @@
                         : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    Number.isFinite(resetMs) &&
+                    resetMs <= now + CLIENT_CLOCK_SKEW_MS &&
+                    (!Number.isFinite(startMs) || resetMs > startMs)
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
