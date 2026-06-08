@@ -30,6 +30,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MAX_CLIENT_CLOCK_SKEW_MS = 10 * 60 * 1000
+MAX_EXTENSION_MS = 8 * 60 * 60 * 1000
+
 
 def _parse_station_ids(raw: str) -> List[int]:
     ids: List[int] = []
@@ -156,6 +159,7 @@ def enrich_stations_with_port_sessions(
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
     now_iso = datetime.now(timezone.utc).isoformat()
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -184,17 +188,21 @@ def enrich_stations_with_port_sessions(
                 continue
 
             old_start = (prev_sess.get(pk_s) or {}).get("started_at")
-            if not was_occ or not old_start:
+            old_start_ms = _iso_to_utc_ms(str(old_start or ""))
+            if not was_occ or not old_start or old_start_ms <= 0:
                 started_at = now_iso
             else:
-                started_at = old_start
+                started_at = str(old_start)
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
             if isinstance(reset, dict):
                 reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
+                if (
+                    isinstance(reset_ms, (int, float))
+                    and reset_ms > _iso_to_utc_ms(started_at)
+                    and reset_ms <= now_ms + MAX_CLIENT_CLOCK_SKEW_MS
+                ):
+                    started_at = datetime.fromtimestamp(
                         reset_ms / 1000, tz=timezone.utc
                     ).isoformat()
 
@@ -212,7 +220,10 @@ def _iso_to_utc_ms(iso: str) -> int:
     if not iso:
         return 0
     s = str(iso).strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError, OverflowError):
+        return 0
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
@@ -234,7 +245,11 @@ def _policy_deadline_ms(
     if isinstance(ext, dict):
         um = ext.get("until_ms")
         if isinstance(um, (int, float)) and um > 0:
-            return int(um)
+            until_ms = int(um)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            max_until = max(base, now_ms) + MAX_EXTENSION_MS
+            if base <= until_ms <= max_until:
+                return until_ms
     return base
 
 

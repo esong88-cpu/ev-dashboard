@@ -160,6 +160,9 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MAX_CLIENT_CLOCK_SKEW_MS = 10 * 60 * 1000;
+        const MAX_EXTENSION_MINUTES = 480;
+        const MAX_EXTENSION_MS = MAX_EXTENSION_MINUTES * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,12 +278,26 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function validClientTimestampMs(raw, now) {
+            return typeof raw === "number" && Number.isFinite(raw) && raw > 0 && raw <= now + MAX_CLIENT_CLOCK_SKEW_MS
+                ? raw
+                : NaN;
+        }
+
+        function basePolicyDeadlineMs(row, limitMin) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
-            const base = start + limitMin * 60 * 1000;
+            return start + limitMin * 60 * 1000;
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
+            const base = basePolicyDeadlineMs(row, limitMin);
+            if (base == null) return null;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) {
+                const maxUntil = Math.max(base, now) + MAX_EXTENSION_MS;
+                if (ext.until_ms >= base && ext.until_ms <= maxUntil) return ext.until_ms;
+            }
             return base;
         }
 
@@ -288,7 +305,7 @@
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
             if (cp === "available") return "available";
-            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            const deadline = policyDeadlineMs(row, limitMin, extMap, now);
             if (deadline == null) return cp;
             if (now >= deadline) return "complete";
             if (cp === "charging" || cp === "complete") return "charging";
@@ -302,21 +319,20 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
+                const resetMs = reset ? validClientTimestampMs(reset.at_ms, now) : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
                     Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
+                const baseDeadline = basePolicyDeadlineMs(row, lim);
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    baseDeadlineMs: baseDeadline,
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
@@ -420,7 +436,7 @@
                         : `<div class="flex-1 flex items-center justify-center text-stone-600 text-[11px] px-1 text-center">${idleHint}</div>`;
                     const ext = extMap[r.key];
                     const extLine =
-                        ext && ext.by
+                        ext && ext.by && r.baseDeadlineMs != null && r.deadlineMs > r.baseDeadlineMs
                             ? `<div class="text-[10px] text-stone-500 text-center mt-1">Extended by ${escAttr(ext.by)}</div>`
                             : "";
                     const sessionStartMs = parseIsoToMs(r.sessionStartedAt);
@@ -702,10 +718,18 @@
                 alert("Session clock not ready yet — wait for the next poller run (up to ~5 min).");
                 return;
             }
+            const now = Date.now();
             const base = start + row.limitMin * 60 * 1000;
             const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const maxUntil = Math.max(base, now) + MAX_EXTENSION_MS;
+            const prevUntil =
+                typeof prev.until_ms === "number" &&
+                Number.isFinite(prev.until_ms) &&
+                prev.until_ms >= base &&
+                prev.until_ms <= maxUntil
+                    ? prev.until_ms
+                    : base;
+            const newUntil = Math.min(maxUntil, Math.max(prevUntil, now) + extra * 60 * 1000);
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
