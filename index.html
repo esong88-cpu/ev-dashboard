@@ -160,6 +160,9 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const CLIENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_MINUTES = 480;
+        const MAX_EXTENSION_WINDOW_MS = 24 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,12 +278,26 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function validClientTimestampMs(raw, now) {
+            return typeof raw === "number" && Number.isFinite(raw) && raw > 0 && raw <= now + CLIENT_CLOCK_SKEW_MS
+                ? raw
+                : NaN;
+        }
+
+        function basePolicyDeadlineMs(row, limitMin) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
-            const base = start + limitMin * 60 * 1000;
+            return start + limitMin * 60 * 1000;
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
+            const base = basePolicyDeadlineMs(row, limitMin);
+            if (base == null) return null;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) {
+                const maxUntil = Math.max(base, now) + MAX_EXTENSION_WINDOW_MS;
+                if (ext.until_ms >= base && ext.until_ms <= maxUntil) return ext.until_ms;
+            }
             return base;
         }
 
@@ -302,21 +319,18 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
+                const resetMs = reset ? validClientTimestampMs(reset.at_ms, now) : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
                     Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
@@ -685,7 +699,7 @@
         extendSaveBtn.addEventListener("click", async () => {
             if (!pendingExtendKey) return;
             const name = extendNameInput.value.trim();
-            const extra = Math.min(480, Math.max(15, parseInt(extendMinutesInput.value, 10) || 120));
+            const extra = Math.min(MAX_EXTENSION_MINUTES, Math.max(15, parseInt(extendMinutesInput.value, 10) || 120));
             if (!name) {
                 alert("Enter your name.");
                 return;
