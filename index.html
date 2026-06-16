@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MAX_CLIENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
+        const MAX_SLOT_EXTENSION_MS = 8 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -215,10 +217,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = rtdbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = rtdbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -275,12 +276,42 @@
             return NaN;
         }
 
-        function policyDeadlineMs(row, limitMin, extMap) {
+        function rtdbMap(obj) {
+            if (!obj || typeof obj !== "object") return {};
+            if (Array.isArray(obj)) {
+                const out = {};
+                obj.forEach((v, i) => {
+                    if (v != null) out[String(i)] = v;
+                });
+                return out;
+            }
+            return obj;
+        }
+
+        function numericEpochMs(raw) {
+            if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return NaN;
+            return raw;
+        }
+
+        function resetStartedAt(row, reset, now) {
+            if (!reset || typeof reset !== "object") return row.sessionStartedAt;
+            const resetMs = numericEpochMs(reset.at_ms);
+            if (!Number.isFinite(resetMs) || resetMs > now + MAX_CLIENT_CLOCK_SKEW_MS) {
+                return row.sessionStartedAt;
+            }
+            const startMs = parseIsoToMs(row.sessionStartedAt);
+            if (Number.isFinite(startMs) && resetMs <= startMs) return row.sessionStartedAt;
+            return new Date(resetMs).toISOString();
+        }
+
+        function policyDeadlineMs(row, limitMin, extMap, now = Date.now()) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
-            const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            const ext = rtdbMap(extMap)[row.key];
+            const untilMs = ext && typeof ext === "object" ? numericEpochMs(ext.until_ms) : NaN;
+            const maxDeadline = Math.max(base, now) + MAX_SLOT_EXTENSION_MS;
+            if (Number.isFinite(untilMs) && untilMs >= base && untilMs <= maxDeadline) return untilMs;
             return base;
         }
 
@@ -288,7 +319,7 @@
         function effectiveBucket(row, limitMin, extMap, now) {
             const cp = statusBucket(row.status);
             if (cp === "available") return "available";
-            const deadline = policyDeadlineMs(row, limitMin, extMap);
+            const deadline = policyDeadlineMs(row, limitMin, extMap, now);
             if (deadline == null) return cp;
             if (now >= deadline) return "complete";
             if (cp === "charging" || cp === "complete") return "charging";
@@ -301,22 +332,14 @@
             const stable = flattenPortsStable(stations);
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
-                const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
-                const startMs = parseIsoToMs(r.sessionStartedAt);
-                const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
-                        : r.sessionStartedAt;
+                const reset = rtdbMap(resetMap)[r.key];
+                const sessionStartedAt = resetStartedAt(r, reset, now);
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
                     cpBucket,
                     eff: effectiveBucket(row, lim, extMap, now),
-                    deadlineMs: policyDeadlineMs(row, lim, extMap),
+                    deadlineMs: policyDeadlineMs(row, lim, extMap, now),
                     limitMin: lim,
                 };
             });
@@ -589,8 +612,8 @@
                 return;
             }
             lastPollerIso = data.last_updated ?? null;
-            const ext = lastExtMap && typeof lastExtMap === "object" ? lastExtMap : {};
-            const resets = lastResetMap && typeof lastResetMap === "object" ? lastResetMap : {};
+            const ext = rtdbMap(lastExtMap);
+            const resets = rtdbMap(lastResetMap);
             const now = Date.now();
             const annotatedStable = annotateRows(data, ext, resets, now);
             const slots = stallSlotsFromRows(annotatedStable);
@@ -703,9 +726,10 @@
                 return;
             }
             const base = start + row.limitMin * 60 * 1000;
-            const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const ext = rtdbMap(lastExtMap);
+            const anchor = Math.max(policyDeadlineMs(row, row.limitMin, ext, Date.now()) ?? base, Date.now());
+            const maxUntil = Math.max(base, Date.now()) + MAX_SLOT_EXTENSION_MS;
+            const newUntil = Math.min(anchor + extra * 60 * 1000, maxUntil);
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,

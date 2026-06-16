@@ -6,11 +6,41 @@
     },
     "slot_extensions": {
       ".read": true,
-      ".write": true
+      "$slot": {
+        ".write": "newData.val() === null || newData.hasChildren(['by', 'at', 'extra_minutes', 'until_ms'])",
+        ".validate": "newData.hasChildren(['by', 'at', 'extra_minutes', 'until_ms'])",
+        "by": {
+          ".validate": "newData.isString() && newData.val().length <= 80"
+        },
+        "at": {
+          ".validate": "newData.isString() && newData.val().length <= 40"
+        },
+        "extra_minutes": {
+          ".validate": "newData.isNumber() && newData.val() >= 15 && newData.val() <= 480"
+        },
+        "until_ms": {
+          ".validate": "newData.isNumber() && newData.val() >= now - 300000 && newData.val() <= now + 36000000"
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
     },
     "slot_resets": {
       ".read": true,
-      ".write": true
+      "$slot": {
+        ".write": "newData.val() === null || newData.hasChildren(['at', 'at_ms'])",
+        ".validate": "newData.hasChildren(['at', 'at_ms'])",
+        "at": {
+          ".validate": "newData.isString() && newData.val().length <= 40"
+        },
+        "at_ms": {
+          ".validate": "newData.isNumber() && newData.val() >= now - 86400000 && newData.val() <= now + 300000"
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
     }
   }
 }
