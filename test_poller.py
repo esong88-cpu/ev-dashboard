@@ -163,7 +163,7 @@ class PollerTimerHardeningTest(unittest.TestCase):
                 "1",
                 started,
                 120,
-                {"101-1": {"until_ms": now + poller.MAX_EXTENSION_MS + 1}},
+                {"101-1": {"until_ms": base + poller.MAX_EXTENSION_MS + 1}},
                 now,
             ),
         )
