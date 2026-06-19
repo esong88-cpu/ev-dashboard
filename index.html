@@ -293,7 +293,7 @@
                 ? reset.at_ms
                 : NaN;
             if (!Number.isFinite(resetMs)) return NaN;
-            if (Number.isFinite(currentStartMs) && resetMs <= currentStartMs) return NaN;
+            if (!Number.isFinite(currentStartMs) || resetMs <= currentStartMs) return NaN;
             if (resetMs > now + MAX_RESET_FUTURE_SKEW_MS) return NaN;
             return resetMs;
         }
