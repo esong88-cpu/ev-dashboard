@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_CLOCK_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_MS = 8 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -176,6 +178,20 @@
             if (s === "charging") return "charging";
             if (s === "complete") return "complete";
             return "other";
+        }
+
+        function firebaseMap(value) {
+            if (!value || typeof value !== "object") return {};
+            if (!Array.isArray(value)) return value;
+            const out = {};
+            value.forEach((v, i) => {
+                if (v != null) out[String(i)] = v;
+            });
+            return out;
+        }
+
+        function finiteNumber(value) {
+            return typeof value === "number" && Number.isFinite(value) ? value : NaN;
         }
 
         function formatDuration(ms) {
@@ -215,10 +231,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = firebaseMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = firebaseMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -279,9 +294,22 @@
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
-            const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            const ext = firebaseMap(extMap)[row.key];
+            const untilMs = ext && typeof ext === "object" ? finiteNumber(ext.until_ms) : NaN;
+            if (Number.isFinite(untilMs) && untilMs > base && untilMs <= base + MAX_EXTENSION_MS) {
+                return untilMs;
+            }
             return base;
+        }
+
+        function boundedResetMs(reset, startMs, now) {
+            if (!reset || typeof reset !== "object") return NaN;
+            const resetMs = finiteNumber(reset.at_ms);
+            if (!Number.isFinite(resetMs)) return NaN;
+            const currentStartMs = Number.isFinite(startMs) ? startMs : 0;
+            if (resetMs <= currentStartMs) return NaN;
+            if (resetMs > now + RESET_CLOCK_SKEW_MS) return NaN;
+            return resetMs;
         }
 
         /** Lot + “complete” list use co-op policy; falls back to ChargePoint if no session clock yet. */
@@ -301,16 +329,11 @@
             const stable = flattenPortsStable(stations);
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
-                const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
+                const reset = firebaseMap(resetMap)[r.key];
                 const startMs = parseIsoToMs(r.sessionStartedAt);
+                const resetMs = boundedResetMs(reset, startMs, now);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
-                        : r.sessionStartedAt;
+                    Number.isFinite(resetMs) ? new Date(resetMs).toISOString() : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
@@ -418,7 +441,7 @@
                               isOverdue ? "overdue" : "charging"
                           )}</div>`
                         : `<div class="flex-1 flex items-center justify-center text-stone-600 text-[11px] px-1 text-center">${idleHint}</div>`;
-                    const ext = extMap[r.key];
+                    const ext = firebaseMap(extMap)[r.key];
                     const extLine =
                         ext && ext.by
                             ? `<div class="text-[10px] text-stone-500 text-center mt-1">Extended by ${escAttr(ext.by)}</div>`
@@ -589,8 +612,8 @@
                 return;
             }
             lastPollerIso = data.last_updated ?? null;
-            const ext = lastExtMap && typeof lastExtMap === "object" ? lastExtMap : {};
-            const resets = lastResetMap && typeof lastResetMap === "object" ? lastResetMap : {};
+            const ext = firebaseMap(lastExtMap);
+            const resets = firebaseMap(lastResetMap);
             const now = Date.now();
             const annotatedStable = annotateRows(data, ext, resets, now);
             const slots = stallSlotsFromRows(annotatedStable);
@@ -618,7 +641,7 @@
         onValue(
             extensionsRef,
             (snap) => {
-                lastExtMap = snap.val() || {};
+                lastExtMap = firebaseMap(snap.val());
                 if (lastStationPayload) renderFromCache();
             },
             (err) => {
@@ -629,7 +652,7 @@
         onValue(
             resetsRef,
             (snap) => {
-                lastResetMap = snap.val() || {};
+                lastResetMap = firebaseMap(snap.val());
                 if (lastStationPayload) renderFromCache();
             },
             (err) => {
@@ -703,9 +726,9 @@
                 return;
             }
             const base = start + row.limitMin * 60 * 1000;
-            const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const anchor = policyDeadlineMs(row, row.limitMin, lastExtMap || {}) ?? base;
+            const requestedUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const newUntil = Math.min(requestedUntil, base + MAX_EXTENSION_MS);
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
