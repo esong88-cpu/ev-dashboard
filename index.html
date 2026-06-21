@@ -160,6 +160,9 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MAX_EXTENSION_MINUTES = 480;
+        const MAX_EXTENSION_MS = MAX_EXTENSION_MINUTES * 60 * 1000;
+        const RESET_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -176,6 +179,18 @@
             if (s === "charging") return "charging";
             if (s === "complete") return "complete";
             return "other";
+        }
+
+        function normalizeDbMap(obj) {
+            if (!obj || typeof obj !== "object") return {};
+            if (Array.isArray(obj)) {
+                const out = {};
+                obj.forEach((value, index) => {
+                    if (value != null) out[String(index)] = value;
+                });
+                return out;
+            }
+            return obj;
         }
 
         function formatDuration(ms) {
@@ -215,10 +230,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = normalizeDbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = normalizeDbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -280,7 +294,9 @@
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) {
+                return Math.min(Math.max(ext.until_ms, base), base + MAX_EXTENSION_MS);
+            }
             return base;
         }
 
@@ -308,8 +324,10 @@
                         : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    Number.isFinite(resetMs) &&
+                    resetMs <= now + RESET_CLOCK_SKEW_MS &&
+                    (!Number.isFinite(startMs) || resetMs > startMs)
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
@@ -618,7 +636,7 @@
         onValue(
             extensionsRef,
             (snap) => {
-                lastExtMap = snap.val() || {};
+                lastExtMap = normalizeDbMap(snap.val());
                 if (lastStationPayload) renderFromCache();
             },
             (err) => {
@@ -629,7 +647,7 @@
         onValue(
             resetsRef,
             (snap) => {
-                lastResetMap = snap.val() || {};
+                lastResetMap = normalizeDbMap(snap.val());
                 if (lastStationPayload) renderFromCache();
             },
             (err) => {
@@ -704,8 +722,12 @@
             }
             const base = start + row.limitMin * 60 * 1000;
             const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const prevUntil =
+                typeof prev.until_ms === "number" && Number.isFinite(prev.until_ms)
+                    ? Math.min(Math.max(prev.until_ms, base), base + MAX_EXTENSION_MS)
+                    : base;
+            const anchor = Math.max(prevUntil, Date.now());
+            const newUntil = Math.min(anchor + extra * 60 * 1000, base + MAX_EXTENSION_MS);
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
