@@ -160,6 +160,9 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MS_PER_MINUTE = 60 * 1000;
+        const RESET_FUTURE_SKEW_MS = 10 * MS_PER_MINUTE;
+        const MAX_EXTENSION_MS = 8 * 60 * MS_PER_MINUTE;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -207,6 +210,18 @@
 
         const META_KEYS = new Set(["last_updated", "charging_limit_minutes"]);
 
+        function normalizeDbMap(value) {
+            if (!value || typeof value !== "object") return {};
+            if (Array.isArray(value)) {
+                const out = {};
+                value.forEach((v, i) => {
+                    if (v !== null && v !== undefined) out[String(i)] = v;
+                });
+                return out;
+            }
+            return Object.fromEntries(Object.entries(value).map(([k, v]) => [String(k), v]));
+        }
+
         /** Rows in stable order (device id, port) — no status sort (for fixed parking stalls). */
         function flattenPortsStable(stations) {
             const rows = [];
@@ -215,10 +230,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = normalizeDbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = normalizeDbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -275,12 +289,28 @@
             return NaN;
         }
 
+        function boundedResetAtMs(reset, currentStartMs, now) {
+            if (!reset || typeof reset !== "object") return NaN;
+            const resetMs = reset.at_ms;
+            if (typeof resetMs !== "number" || !Number.isFinite(resetMs)) return NaN;
+            if (resetMs <= 0 || resetMs > now + RESET_FUTURE_SKEW_MS) return NaN;
+            if (Number.isFinite(currentStartMs) && resetMs <= currentStartMs) return NaN;
+            return resetMs;
+        }
+
+        function boundedExtensionUntilMs(base, untilMs) {
+            if (typeof untilMs !== "number" || !Number.isFinite(untilMs)) return null;
+            if (untilMs < base || untilMs > base + MAX_EXTENSION_MS) return null;
+            return untilMs;
+        }
+
         function policyDeadlineMs(row, limitMin, extMap) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            const bounded = boundedExtensionUntilMs(base, ext?.until_ms);
+            if (bounded !== null) return bounded;
             return base;
         }
 
@@ -302,14 +332,11 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
+                const resetMs = boundedResetAtMs(reset, startMs, now);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    Number.isFinite(resetMs)
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
@@ -702,10 +729,14 @@
                 alert("Session clock not ready yet — wait for the next poller run (up to ~5 min).");
                 return;
             }
-            const base = start + row.limitMin * 60 * 1000;
-            const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const base = start + row.limitMin * MS_PER_MINUTE;
+            const currentDeadline = policyDeadlineMs(row, row.limitMin, lastExtMap || {}) ?? base;
+            const proposedUntil = Math.max(currentDeadline, Date.now()) + extra * MS_PER_MINUTE;
+            const newUntil = Math.min(proposedUntil, base + MAX_EXTENSION_MS);
+            if (newUntil <= Date.now()) {
+                alert("This session has already reached the maximum extension window.");
+                return;
+            }
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
