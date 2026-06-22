@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import firebase_admin
 from firebase_admin import credentials, db
@@ -29,6 +30,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logger = logging.getLogger(__name__)
+
+MS_PER_MINUTE = 60 * 1000
+RESET_FUTURE_SKEW_MS = 10 * MS_PER_MINUTE
+MAX_EXTENSION_MS = 8 * 60 * MS_PER_MINUTE
 
 
 def _parse_station_ids(raw: str) -> List[int]:
@@ -134,6 +139,18 @@ def _rtdb_map(obj: Any) -> Dict[str, Any]:
     return {}
 
 
+def _finite_ms(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return int(value)
+    return None
+
+
+def _utc_now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
 def _session_occupancy_bucket(label: str) -> str:
     """available vs still plugged / in use (charging or CP-reported complete)."""
     n = (label or "").strip().lower()
@@ -155,7 +172,9 @@ def enrich_stations_with_port_sessions(
         for k, v in prev_root.items()
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    now_ms = int(now_dt.timestamp() * 1000)
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -184,17 +203,23 @@ def enrich_stations_with_port_sessions(
                 continue
 
             old_start = (prev_sess.get(pk_s) or {}).get("started_at")
-            if not was_occ or not old_start:
+            old_start_ms = _iso_to_utc_ms(old_start)
+            if not was_occ or old_start_ms <= 0:
                 started_at = now_iso
             else:
-                started_at = old_start
+                started_at = str(old_start)
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
             if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
+                reset_ms = _finite_ms(reset.get("at_ms"))
+                if (
+                    reset_ms is not None
+                    and reset_ms > 0
+                    and reset_ms <= now_ms + RESET_FUTURE_SKEW_MS
+                    and (old_start_ms <= 0 or reset_ms > old_start_ms)
+                    and (was_occ or old_start_ms > 0)
+                ):
+                    started_at = datetime.fromtimestamp(
                         reset_ms / 1000, tz=timezone.utc
                     ).isoformat()
 
@@ -208,14 +233,37 @@ def enrich_stations_with_port_sessions(
     return ext_clear
 
 
-def _iso_to_utc_ms(iso: str) -> int:
+def _iso_to_utc_ms(iso: Any) -> int:
     if not iso:
         return 0
-    s = str(iso).strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+    if isinstance(iso, bool):
+        return 0
+    if isinstance(iso, (int, float)) and math.isfinite(iso):
+        return int(iso if iso > 1e12 else iso * 1000)
+    try:
+        s = str(iso).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _bounded_extension_deadline_ms(
+    sid: str, pk_s: str, base_deadline_ms: int, ext_map: Dict[str, Any]
+) -> int:
+    slot_key = f"{sid}-{pk_s}"
+    ext = ext_map.get(slot_key) if isinstance(ext_map, dict) else None
+    if not isinstance(ext, dict):
+        return base_deadline_ms
+    until_ms = _finite_ms(ext.get("until_ms"))
+    if until_ms is None:
+        return base_deadline_ms
+    max_deadline_ms = base_deadline_ms + MAX_EXTENSION_MS
+    if base_deadline_ms <= until_ms <= max_deadline_ms:
+        return until_ms
+    return base_deadline_ms
 
 
 def _policy_deadline_ms(
@@ -229,13 +277,7 @@ def _policy_deadline_ms(
     if start_ms <= 0:
         return 0
     base = start_ms + limit_minutes * 60 * 1000
-    slot_key = f"{sid}-{pk_s}"
-    ext = ext_map.get(slot_key) if isinstance(ext_map, dict) else None
-    if isinstance(ext, dict):
-        um = ext.get("until_ms")
-        if isinstance(um, (int, float)) and um > 0:
-            return int(um)
-    return base
+    return _bounded_extension_deadline_ms(sid, pk_s, base, ext_map)
 
 
 def enrich_policy_complete_since(
@@ -407,6 +449,51 @@ def poll_once(client: ChargePoint, station_ids: List[int], home_ids: set) -> Dic
     return stations
 
 
+def preserve_station_state_on_fetch_errors(
+    prev_root: Dict[str, Any], stations: Dict[str, Any]
+) -> None:
+    """Keep last-known port/session data when a transient fetch would erase it."""
+    prev_stations: Dict[str, Any] = {
+        k: v
+        for k, v in (prev_root or {}).items()
+        if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
+    }
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for sid, entry in list(stations.items()):
+        if not isinstance(entry, dict):
+            continue
+        prev_entry = prev_stations.get(str(sid)) or {}
+        if not isinstance(prev_entry, dict):
+            continue
+        prev_ports = _rtdb_map(prev_entry.get("ports"))
+        if not prev_ports:
+            continue
+        prev_sessions = _rtdb_map(prev_entry.get("port_sessions"))
+
+        if entry.get("error"):
+            error_at = str(entry.get("updated_at") or now_iso)
+            preserved = {**prev_entry}
+            preserved.pop("error", None)
+            preserved["ports"] = prev_ports
+            if prev_sessions:
+                preserved["port_sessions"] = prev_sessions
+            preserved["last_fetch_error"] = str(entry.get("error") or "station fetch failed")
+            preserved["last_fetch_error_at"] = error_at
+            preserved["stale"] = True
+            stations[str(sid)] = preserved
+            continue
+
+        ports = _rtdb_map(entry.get("ports"))
+        if not ports:
+            entry["ports"] = prev_ports
+            if prev_sessions:
+                entry["port_sessions"] = prev_sessions
+            entry["last_fetch_error"] = "station fetch returned no port data"
+            entry["last_fetch_error_at"] = str(entry.get("updated_at") or now_iso)
+            entry["stale"] = True
+
+
 def main() -> None:
     # GitHub Actions / secrets (primary)
     username = (os.getenv("CHARGEPOINT_USER") or "").strip()
@@ -460,6 +547,7 @@ def main() -> None:
     ref = db.reference("/stations")
     prev_root = ref.get() or {}
     payload = poll_once(client, station_ids, home_ids)
+    preserve_station_state_on_fetch_errors(prev_root, payload)
     reset_map = db.reference("/slot_resets").get() or {}
     if not isinstance(reset_map, dict):
         reset_map = {}
