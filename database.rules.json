@@ -6,11 +6,17 @@
     },
     "slot_extensions": {
       ".read": true,
-      ".write": true
+      ".write": true,
+      "$slot": {
+        ".validate": "!newData.exists() || (newData.hasChildren(['by', 'at', 'extra_minutes', 'until_ms']) && newData.child('by').isString() && newData.child('by').val().length <= 80 && newData.child('at').isString() && newData.child('extra_minutes').isNumber() && newData.child('extra_minutes').val() >= 15 && newData.child('extra_minutes').val() <= 480 && newData.child('until_ms').isNumber() && newData.child('until_ms').val() > 0 && newData.child('until_ms').val() <= now + 28800000)"
+      }
     },
     "slot_resets": {
       ".read": true,
-      ".write": true
+      ".write": true,
+      "$slot": {
+        ".validate": "!newData.exists() || (newData.hasChildren(['at', 'at_ms']) && newData.child('at').isString() && newData.child('at_ms').isNumber() && newData.child('at_ms').val() > 0 && newData.child('at_ms').val() <= now + 300000)"
+      }
     }
   }
 }
