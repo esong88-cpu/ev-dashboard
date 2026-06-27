@@ -118,7 +118,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-        import { getDatabase, ref, onValue, set } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+        import { getDatabase, ref, onValue, set, update } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyCMLfdk0kPpl3g_BjVkuUOLlivS25jZAQw",
@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MAX_RESET_FUTURE_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_MS = 8 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -176,6 +178,20 @@
             if (s === "charging") return "charging";
             if (s === "complete") return "complete";
             return "other";
+        }
+
+        function finiteNumber(value) {
+            return typeof value === "number" && Number.isFinite(value);
+        }
+
+        function rtdbMap(value) {
+            if (!value || typeof value !== "object") return {};
+            if (!Array.isArray(value)) return value;
+            const out = {};
+            value.forEach((item, index) => {
+                if (item !== null && item !== undefined) out[String(index)] = item;
+            });
+            return out;
         }
 
         function formatDuration(ms) {
@@ -215,10 +231,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = rtdbMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = rtdbMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
@@ -280,7 +295,9 @@
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && finiteNumber(ext.until_ms) && ext.until_ms > 0) {
+                return Math.min(Math.max(ext.until_ms, base), base + MAX_EXTENSION_MS);
+            }
             return base;
         }
 
@@ -302,14 +319,13 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
+                const resetMs = reset && finiteNumber(reset.at_ms) ? reset.at_ms : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    Number.isFinite(resetMs) &&
+                    resetMs <= now + MAX_RESET_FUTURE_SKEW_MS &&
+                    (!Number.isFinite(startMs) || resetMs > startMs)
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
@@ -645,11 +661,13 @@
                 const ok = confirm("Reset this spot's timer because a new car just parked here?");
                 if (!ok) return;
                 const now = Date.now();
-                set(ref(db, `slot_resets/${key}`), {
-                    at: new Date(now).toISOString(),
-                    at_ms: now,
+                update(ref(db), {
+                    [`slot_resets/${key}`]: {
+                        at: new Date(now).toISOString(),
+                        at_ms: now,
+                    },
+                    [`slot_extensions/${key}`]: null,
                 })
-                    .then(() => set(ref(db, `slot_extensions/${key}`), null))
                     .catch((err) => {
                         console.error(err);
                         alert(
@@ -703,9 +721,9 @@
                 return;
             }
             const base = start + row.limitMin * 60 * 1000;
-            const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const currentDeadline = policyDeadlineMs(row, row.limitMin, lastExtMap || {}) ?? base;
+            const anchor = Math.max(currentDeadline, Date.now());
+            const newUntil = Math.min(anchor + extra * 60 * 1000, base + MAX_EXTENSION_MS);
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
