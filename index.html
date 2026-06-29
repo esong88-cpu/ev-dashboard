@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MAX_RESET_FUTURE_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_MS = 8 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -280,7 +282,15 @@
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (
+                ext &&
+                typeof ext.until_ms === "number" &&
+                Number.isFinite(ext.until_ms) &&
+                ext.until_ms >= base &&
+                ext.until_ms <= base + MAX_EXTENSION_MS
+            ) {
+                return ext.until_ms;
+            }
             return base;
         }
 
@@ -308,8 +318,10 @@
                         : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                    Number.isFinite(resetMs) &&
+                    resetMs <= now + MAX_RESET_FUTURE_SKEW_MS &&
+                    (!Number.isFinite(startMs) || resetMs > startMs)
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
@@ -704,8 +716,21 @@
             }
             const base = start + row.limitMin * 60 * 1000;
             const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const prevUntil =
+                typeof prev.until_ms === "number" &&
+                Number.isFinite(prev.until_ms) &&
+                prev.until_ms >= base &&
+                prev.until_ms <= base + MAX_EXTENSION_MS
+                    ? prev.until_ms
+                    : base;
+            const newUntil = Math.min(
+                Math.max(prevUntil, Date.now()) + extra * 60 * 1000,
+                base + MAX_EXTENSION_MS
+            );
+            if (newUntil <= Date.now()) {
+                alert("This session is already past the maximum extension window.");
+                return;
+            }
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
