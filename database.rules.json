@@ -6,11 +6,21 @@
     },
     "slot_extensions": {
       ".read": true,
-      ".write": true
+      "$slot": {
+        ".write": "newData.val() === null || (newData.hasChildren(['by', 'at', 'extra_minutes', 'until_ms']) && newData.child('by').isString() && newData.child('by').val().length <= 80 && newData.child('at').isString() && newData.child('extra_minutes').isNumber() && newData.child('extra_minutes').val() >= 15 && newData.child('extra_minutes').val() <= 480 && newData.child('until_ms').isNumber() && newData.child('until_ms').val() > now && newData.child('until_ms').val() <= now + 36000000)",
+        "$other": {
+          ".validate": "$other === 'by' || $other === 'at' || $other === 'extra_minutes' || $other === 'until_ms'"
+        }
+      }
     },
     "slot_resets": {
       ".read": true,
-      ".write": true
+      "$slot": {
+        ".write": "newData.val() === null || (newData.hasChildren(['at', 'at_ms']) && newData.child('at').isString() && newData.child('at_ms').isNumber() && newData.child('at_ms').val() <= now + 300000)",
+        "$other": {
+          ".validate": "$other === 'at' || $other === 'at_ms'"
+        }
+      }
     }
   }
 }
