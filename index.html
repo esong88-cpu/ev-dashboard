@@ -118,7 +118,7 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
-        import { getDatabase, ref, onValue, set } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+        import { getDatabase, ref, onValue, set, update } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyCMLfdk0kPpl3g_BjVkuUOLlivS25jZAQw",
@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const MAX_RESET_FUTURE_SKEW_MS = 5 * 60 * 1000;
+        const MAX_EXTENSION_MS = 8 * 60 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,12 +277,24 @@
             return NaN;
         }
 
+        function boundedResetStart(reset, currentStartMs, now) {
+            if (!reset || typeof reset !== "object") return null;
+            const resetMs = reset.at_ms;
+            if (!Number.isFinite(resetMs) || resetMs > now + MAX_RESET_FUTURE_SKEW_MS) return null;
+            if (!Number.isFinite(currentStartMs) || resetMs > currentStartMs) {
+                return new Date(resetMs).toISOString();
+            }
+            return null;
+        }
+
         function policyDeadlineMs(row, limitMin, extMap) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) {
+                return Math.max(base, Math.min(ext.until_ms, base + MAX_EXTENSION_MS));
+            }
             return base;
         }
 
@@ -302,15 +316,9 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
-                const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
-                        : r.sessionStartedAt;
+                const resetStart = boundedResetStart(reset, startMs, now);
+                const sessionStartedAt = resetStart || r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
@@ -645,11 +653,13 @@
                 const ok = confirm("Reset this spot's timer because a new car just parked here?");
                 if (!ok) return;
                 const now = Date.now();
-                set(ref(db, `slot_resets/${key}`), {
-                    at: new Date(now).toISOString(),
-                    at_ms: now,
+                update(ref(db), {
+                    [`slot_resets/${key}`]: {
+                        at: new Date(now).toISOString(),
+                        at_ms: now,
+                    },
+                    [`slot_extensions/${key}`]: null,
                 })
-                    .then(() => set(ref(db, `slot_extensions/${key}`), null))
                     .catch((err) => {
                         console.error(err);
                         alert(
@@ -704,8 +714,12 @@
             }
             const base = start + row.limitMin * 60 * 1000;
             const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
-            const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
+            const prevUntil =
+                typeof prev.until_ms === "number" && Number.isFinite(prev.until_ms)
+                    ? Math.max(base, Math.min(prev.until_ms, base + MAX_EXTENSION_MS))
+                    : base;
+            const anchor = Math.max(prevUntil, Date.now());
+            const newUntil = Math.min(anchor + extra * 60 * 1000, base + MAX_EXTENSION_MS);
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {
                     by: name,
