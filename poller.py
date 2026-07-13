@@ -6,21 +6,30 @@ Intended for GitHub Actions on a schedule (cron); run locally by setting the sam
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import firebase_admin
 from firebase_admin import credentials, db
-from requests import codes
 
 from python_chargepoint import ChargePoint
 from python_chargepoint.exceptions import (
-    ChargePointCommunicationException,
-    ChargePointLoginError,
+    CommunicationError,
+    DatadomeCaptcha,
+    LoginError,
+)
+
+# Persisted on the runner's local disk (NOT inside the repo checkout, which
+# actions/checkout wipes clean every run) so the coulomb_sess cookie can keep
+# rotating across 5-minute polls instead of dying at ChargePoint's ~2hr cap.
+TOKEN_STATE_PATH = Path(
+    os.getenv("CHARGEPOINT_TOKEN_STATE_PATH") or os.path.expanduser("~/.chargepoint_session_token")
 )
 
 logging.basicConfig(
@@ -294,30 +303,29 @@ def enrich_policy_complete_since(
         entry["port_sessions"] = psessions
 
 
-def fetch_public_station(
+async def fetch_public_station(
     client: ChargePoint, station_id: int
 ) -> Dict[str, Any]:
-    """GET mapcache v3/station/info (same endpoint as python-chargepoint v2+)."""
-    base = client.global_config.endpoints.mapcache.rstrip("/")
-    url = f"{base}/v3/station/info"
-    resp = client.session.get(
-        url,
-        params={"deviceId": str(station_id), "use_cache": "false"},
-        timeout=60,
+    """
+    GET mapcache v3/station/info as raw JSON. Deliberately bypasses the
+    library's get_station()/StationInfo model (reaches into client._request)
+    because StationInfo doesn't expose the per-port outlet detail we need.
+    """
+    url = (
+        client.global_config.endpoints.mapcache_endpoint / "v3/station/info"
+    ).update_query({"deviceId": str(station_id), "use_cache": "false"})
+    response = await client._request("GET", url)
+    await client._raise_for_status(
+        response, f"Station info failed for device {station_id}"
     )
-    if resp.status_code != codes.ok:
-        raise ChargePointCommunicationException(
-            response=resp,
-            message=f"Station info failed for device {station_id}: HTTP {resp.status_code}",
-        )
-    return resp.json()
+    return await response.json()
 
 
-def fetch_home_charger_status(
+async def fetch_home_charger_status(
     client: ChargePoint, device_id: int
 ) -> Dict[str, Any]:
     """Home Flex / Panda status — single logical port from charging_status."""
-    hs = client.get_home_charger_status(device_id)
+    hs = await client.get_home_charger_status(device_id)
     raw = hs.charging_status.upper()
     if raw == "AVAILABLE":
         label = "Available"
@@ -337,16 +345,16 @@ def fetch_home_charger_status(
     }
 
 
-def build_station_payload(
+async def build_station_payload(
     client: ChargePoint, station_id: int, home_ids: set
 ) -> Dict[str, Any]:
     # Home Flex chargers use the panda/mobile status API; public posts use mapcache.
     if station_id in home_ids:
-        data = fetch_home_charger_status(client, station_id)
+        data = await fetch_home_charger_status(client, station_id)
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
         return data
 
-    raw = fetch_public_station(client, station_id)
+    raw = await fetch_public_station(client, station_id)
 
     ports_map: Dict[str, str] = {}
     for outlet_num, label in _collect_ports_from_station_json(raw):
@@ -393,11 +401,11 @@ def init_firebase(database_url: str) -> None:
     firebase_admin.initialize_app(cred, {"databaseURL": database_url})
 
 
-def poll_once(client: ChargePoint, station_ids: List[int], home_ids: set) -> Dict[str, Any]:
+async def poll_once(client: ChargePoint, station_ids: List[int], home_ids: set) -> Dict[str, Any]:
     stations: Dict[str, Any] = {}
     for sid in station_ids:
         try:
-            stations[str(sid)] = build_station_payload(client, sid, home_ids)
+            stations[str(sid)] = await build_station_payload(client, sid, home_ids)
         except Exception as exc:
             logger.exception("Failed to fetch station %s: %s", sid, exc)
             stations[str(sid)] = {
@@ -407,7 +415,69 @@ def poll_once(client: ChargePoint, station_ids: List[int], home_ids: set) -> Dic
     return stations
 
 
-def main() -> None:
+def _load_saved_token() -> str:
+    try:
+        return TOKEN_STATE_PATH.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _save_token(token: str) -> None:
+    if not token:
+        return
+    try:
+        TOKEN_STATE_PATH.write_text(token)
+    except OSError as exc:
+        logger.warning("Could not persist refreshed session token: %s", exc)
+
+
+async def get_client(username: str, password: str, session_token: str) -> ChargePoint:
+    """
+    Prefer a coulomb_sess token (env override, else the last one this poller
+    saved) so we never hit the Datadome-protected password login endpoint.
+    ChargePoint reissues coulomb_sess with a fresh ~2hr Max-Age on every
+    authenticated response, so as long as this poller keeps running on an
+    interval shorter than that, persisting the rotated token keeps the
+    session alive indefinitely without ever needing to re-login.
+    """
+    token = session_token or _load_saved_token()
+    if token:
+        try:
+            client = await ChargePoint.create(username=username, coulomb_token=token)
+            logger.info("Logged in to ChargePoint using saved session token.")
+            return client
+        except (CommunicationError, DatadomeCaptcha) as exc:
+            logger.warning(
+                "Saved session token was rejected (%s); falling back to password login.",
+                exc,
+            )
+
+    if not password:
+        raise SystemExit(
+            "No valid session token available and CHARGEPOINT_PASS is not set. "
+            "Capture a fresh coulomb_sess cookie from a logged-in browser and set "
+            "CHARGEPOINT_SESSION_TOKEN (see .env.example)."
+        )
+
+    client = await ChargePoint.create(username=username)
+    try:
+        await client.login_with_password(password)
+    except DatadomeCaptcha:
+        logger.error(
+            "ChargePoint blocked password login with a Datadome captcha. "
+            "Set CHARGEPOINT_SESSION_TOKEN to a fresh coulomb_sess value captured "
+            "from a browser (see .env.example); the poller uses it without hitting "
+            "the login endpoint."
+        )
+        raise
+    except LoginError:
+        logger.error("Failed to authenticate to ChargePoint with password.")
+        raise
+    logger.info("Logged in to ChargePoint using password.")
+    return client
+
+
+async def main() -> None:
     # GitHub Actions / secrets (primary)
     username = (os.getenv("CHARGEPOINT_USER") or "").strip()
     password = os.getenv("CHARGEPOINT_PASS") or ""
@@ -418,7 +488,7 @@ def main() -> None:
     if not username:
         logger.error("Set CHARGEPOINT_USER (ChargePoint login email or username).")
         sys.exit(1)
-    if not password and not session_token:
+    if not password and not session_token and not TOKEN_STATE_PATH.exists():
         logger.error(
             "Set CHARGEPOINT_PASS and/or CHARGEPOINT_SESSION_TOKEN "
             "(session cookie if you use SSO / 2FA)."
@@ -432,75 +502,61 @@ def main() -> None:
     init_firebase(database_url)
 
     logger.info("Logging in to ChargePoint…")
+    client = await get_client(username, password, session_token)
     try:
-        client = ChargePoint(
-            username,
-            password if password else "unused",
-            session_token=session_token,
+        try:
+            home_ids = set(await client.get_home_chargers())
+        except Exception as exc:
+            logger.warning("Could not list home chargers: %s", exc)
+            home_ids = set()
+
+        ref = db.reference("/stations")
+        prev_root = ref.get() or {}
+        payload = await poll_once(client, station_ids, home_ids)
+        reset_map = db.reference("/slot_resets").get() or {}
+        if not isinstance(reset_map, dict):
+            reset_map = {}
+        cleared_ext_keys = enrich_stations_with_port_sessions(prev_root, payload, reset_map)
+        limit_raw = (os.getenv("CHARGING_LIMIT_MINUTES") or "120").strip()
+        try:
+            charging_limit_minutes = max(1, int(limit_raw))
+        except ValueError:
+            charging_limit_minutes = 120
+
+        ext_map = db.reference("/slot_extensions").get() or {}
+        if not isinstance(ext_map, dict):
+            ext_map = {}
+        enrich_policy_complete_since(prev_root, payload, ext_map, charging_limit_minutes)
+
+        last_updated = datetime.now(timezone.utc).isoformat()
+        root_payload: Dict[str, Any] = {
+            "last_updated": last_updated,
+            "charging_limit_minutes": charging_limit_minutes,
+            **payload,
+        }
+        logger.info("Writing %d station(s) to Firebase…", len(payload))
+        ref.set(root_payload)
+
+        if cleared_ext_keys:
+            ext_root = db.reference("/slot_extensions")
+            reset_root = db.reference("/slot_resets")
+            for key in dict.fromkeys(cleared_ext_keys):
+                try:
+                    # null value in update removes the child (works across firebase-admin versions).
+                    ext_root.update({key: None})
+                    reset_root.update({key: None})
+                except Exception as exc:
+                    logger.warning("Could not clear per-slot metadata for %s: %s", key, exc)
+        logger.info(
+            "Updated /stations (last_updated=%s): %s",
+            last_updated,
+            json.dumps(payload, default=str)[:500],
         )
-    except ChargePointLoginError as exc:
-        resp = exc.args[0] if exc.args and hasattr(exc.args[0], "text") else None
-        err_text = (getattr(resp, "text", None) or str(exc)) if resp is not None else str(exc)
-        if "403" in err_text or "captcha" in err_text.lower() or "ad blocker" in err_text.lower():
-            logger.error(
-                "ChargePoint returned a bot-protection page (403 / captcha). "
-                "Password login from cloud IPs (e.g. GitHub Actions) is often blocked. "
-                "Fix: set secret CHARGEPOINT_SESSION_TOKEN to a valid browser session token "
-                "(see .env.example); the poller uses it without hitting the login endpoint. "
-                "Refresh the token periodically when API calls start failing."
-            )
-        raise
-
-    try:
-        home_ids = set(client.get_home_chargers())
-    except Exception as exc:
-        logger.warning("Could not list home chargers: %s", exc)
-        home_ids = set()
-
-    ref = db.reference("/stations")
-    prev_root = ref.get() or {}
-    payload = poll_once(client, station_ids, home_ids)
-    reset_map = db.reference("/slot_resets").get() or {}
-    if not isinstance(reset_map, dict):
-        reset_map = {}
-    cleared_ext_keys = enrich_stations_with_port_sessions(prev_root, payload, reset_map)
-    limit_raw = (os.getenv("CHARGING_LIMIT_MINUTES") or "120").strip()
-    try:
-        charging_limit_minutes = max(1, int(limit_raw))
-    except ValueError:
-        charging_limit_minutes = 120
-
-    ext_map = db.reference("/slot_extensions").get() or {}
-    if not isinstance(ext_map, dict):
-        ext_map = {}
-    enrich_policy_complete_since(prev_root, payload, ext_map, charging_limit_minutes)
-
-    last_updated = datetime.now(timezone.utc).isoformat()
-    root_payload: Dict[str, Any] = {
-        "last_updated": last_updated,
-        "charging_limit_minutes": charging_limit_minutes,
-        **payload,
-    }
-    logger.info("Writing %d station(s) to Firebase…", len(payload))
-    ref.set(root_payload)
-
-    if cleared_ext_keys:
-        ext_root = db.reference("/slot_extensions")
-        reset_root = db.reference("/slot_resets")
-        for key in dict.fromkeys(cleared_ext_keys):
-            try:
-                # null value in update removes the child (works across firebase-admin versions).
-                ext_root.update({key: None})
-                reset_root.update({key: None})
-            except Exception as exc:
-                logger.warning("Could not clear per-slot metadata for %s: %s", key, exc)
-    logger.info(
-        "Updated /stations (last_updated=%s): %s",
-        last_updated,
-        json.dumps(payload, default=str)[:500],
-    )
-    logger.info("Done.")
+        _save_token(client.coulomb_token or "")
+        logger.info("Done.")
+    finally:
+        await client.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
