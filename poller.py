@@ -433,24 +433,32 @@ def _save_token(token: str) -> None:
 
 async def get_client(username: str, password: str, session_token: str) -> ChargePoint:
     """
-    Prefer a coulomb_sess token (env override, else the last one this poller
-    saved) so we never hit the Datadome-protected password login endpoint.
+    Prefer the last coulomb_sess token this poller saved, with the environment
+    token as a bootstrap fallback, so we avoid the Datadome-protected password
+    login endpoint.
     ChargePoint reissues coulomb_sess with a fresh ~2hr Max-Age on every
     authenticated response, so as long as this poller keeps running on an
     interval shorter than that, persisting the rotated token keeps the
     session alive indefinitely without ever needing to re-login.
     """
-    token = session_token or _load_saved_token()
-    if token:
+    tokens: List[str] = []
+    for token in (_load_saved_token(), session_token):
+        if token and token not in tokens:
+            tokens.append(token)
+
+    for index, token in enumerate(tokens):
         try:
             client = await ChargePoint.create(username=username, coulomb_token=token)
-            logger.info("Logged in to ChargePoint using saved session token.")
+            logger.info("Logged in to ChargePoint using session token.")
             return client
         except (CommunicationError, DatadomeCaptcha) as exc:
-            logger.warning(
-                "Saved session token was rejected (%s); falling back to password login.",
-                exc,
-            )
+            if index + 1 < len(tokens):
+                logger.warning("Session token was rejected (%s); trying fallback token.", exc)
+            else:
+                logger.warning(
+                    "Session token was rejected (%s); falling back to password login.",
+                    exc,
+                )
 
     if not password:
         raise SystemExit(
