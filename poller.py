@@ -433,22 +433,32 @@ def _save_token(token: str) -> None:
 
 async def get_client(username: str, password: str, session_token: str) -> ChargePoint:
     """
-    Prefer a coulomb_sess token (env override, else the last one this poller
-    saved) so we never hit the Datadome-protected password login endpoint.
+    Prefer the last coulomb_sess token this poller saved, using the environment
+    token as a bootstrap/fallback, so we avoid the Datadome-protected password
+    login endpoint.
     ChargePoint reissues coulomb_sess with a fresh ~2hr Max-Age on every
     authenticated response, so as long as this poller keeps running on an
     interval shorter than that, persisting the rotated token keeps the
     session alive indefinitely without ever needing to re-login.
     """
-    token = session_token or _load_saved_token()
-    if token:
+    saved_token = _load_saved_token()
+    token_candidates = [
+        ("persisted", saved_token),
+        ("environment", session_token),
+    ]
+    attempted_tokens = set()
+    for source, token in token_candidates:
+        if not token or token in attempted_tokens:
+            continue
+        attempted_tokens.add(token)
         try:
             client = await ChargePoint.create(username=username, coulomb_token=token)
-            logger.info("Logged in to ChargePoint using saved session token.")
+            logger.info("Logged in to ChargePoint using %s session token.", source)
             return client
         except (CommunicationError, DatadomeCaptcha) as exc:
             logger.warning(
-                "Saved session token was rejected (%s); falling back to password login.",
+                "%s session token was rejected (%s).",
+                source.capitalize(),
                 exc,
             )
 
@@ -475,6 +485,13 @@ async def get_client(username: str, password: str, session_token: str) -> Charge
         raise
     logger.info("Logged in to ChargePoint using password.")
     return client
+
+
+async def _persist_token_and_close(client: ChargePoint) -> None:
+    try:
+        _save_token(client.coulomb_token or "")
+    finally:
+        await client.close()
 
 
 async def main() -> None:
@@ -552,10 +569,9 @@ async def main() -> None:
             last_updated,
             json.dumps(payload, default=str)[:500],
         )
-        _save_token(client.coulomb_token or "")
         logger.info("Done.")
     finally:
-        await client.close()
+        await _persist_token_and_close(client)
 
 
 if __name__ == "__main__":
