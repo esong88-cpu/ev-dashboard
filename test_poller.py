@@ -42,7 +42,7 @@ class SessionTokenTests(unittest.IsolatedAsyncioTestCase):
             "create",
             AsyncMock(
                 side_effect=[
-                    poller.CommunicationError("expired"),
+                    poller.CommunicationError(None, "expired"),
                     client,
                 ]
             ),
