@@ -11,10 +11,12 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import aiohttp
 import firebase_admin
 from firebase_admin import credentials, db
 
@@ -22,6 +24,7 @@ from python_chargepoint import ChargePoint
 from python_chargepoint.exceptions import (
     CommunicationError,
     DatadomeCaptcha,
+    InvalidSession,
     LoginError,
 )
 
@@ -425,30 +428,73 @@ def _load_saved_token() -> str:
 def _save_token(token: str) -> None:
     if not token:
         return
+    temporary_path = ""
     try:
-        TOKEN_STATE_PATH.write_text(token)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=TOKEN_STATE_PATH.parent,
+            prefix=f".{TOKEN_STATE_PATH.name}.",
+            delete=False,
+        ) as temporary_file:
+            temporary_file.write(token)
+            temporary_path = temporary_file.name
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, TOKEN_STATE_PATH)
     except OSError as exc:
         logger.warning("Could not persist refreshed session token: %s", exc)
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+
+
+async def _create_client(username: str, token: str = "") -> ChargePoint:
+    """Create a client without leaking its aiohttp session if setup fails."""
+    session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+    try:
+        client = await ChargePoint.create(
+            username=username,
+            coulomb_token=token,
+            session=session,
+        )
+    except BaseException:
+        await session.close()
+        raise
+
+    # ChargePoint does not own caller-supplied sessions. Transfer ownership so
+    # the existing client.close() cleanup also closes this session.
+    client._owns_session = True
+    return client
 
 
 async def get_client(username: str, password: str, session_token: str) -> ChargePoint:
     """
-    Prefer a coulomb_sess token (env override, else the last one this poller
-    saved) so we never hit the Datadome-protected password login endpoint.
+    Prefer the last coulomb_sess token this poller saved, using the environment
+    token only to bootstrap or recover from invalid local state.
     ChargePoint reissues coulomb_sess with a fresh ~2hr Max-Age on every
     authenticated response, so as long as this poller keeps running on an
     interval shorter than that, persisting the rotated token keeps the
     session alive indefinitely without ever needing to re-login.
     """
-    token = session_token or _load_saved_token()
-    if token:
+    token_candidates = (
+        ("persisted", _load_saved_token()),
+        ("environment", session_token),
+    )
+    attempted_tokens = set()
+    for source, token in token_candidates:
+        if not token or token in attempted_tokens:
+            continue
+        attempted_tokens.add(token)
         try:
-            client = await ChargePoint.create(username=username, coulomb_token=token)
-            logger.info("Logged in to ChargePoint using saved session token.")
+            client = await _create_client(username, token)
+            logger.info("Logged in to ChargePoint using %s session token.", source)
             return client
-        except (CommunicationError, DatadomeCaptcha) as exc:
+        except InvalidSession as exc:
             logger.warning(
-                "Saved session token was rejected (%s); falling back to password login.",
+                "%s session token was rejected (%s).",
+                source.capitalize(),
                 exc,
             )
 
@@ -459,7 +505,7 @@ async def get_client(username: str, password: str, session_token: str) -> Charge
             "CHARGEPOINT_SESSION_TOKEN (see .env.example)."
         )
 
-    client = await ChargePoint.create(username=username)
+    client = await _create_client(username)
     try:
         await client.login_with_password(password)
     except DatadomeCaptcha:
@@ -469,9 +515,11 @@ async def get_client(username: str, password: str, session_token: str) -> Charge
             "from a browser (see .env.example); the poller uses it without hitting "
             "the login endpoint."
         )
+        await client.close()
         raise
     except LoginError:
         logger.error("Failed to authenticate to ChargePoint with password.")
+        await client.close()
         raise
     logger.info("Logged in to ChargePoint using password.")
     return client
@@ -552,10 +600,12 @@ async def main() -> None:
             last_updated,
             json.dumps(payload, default=str)[:500],
         )
-        _save_token(client.coulomb_token or "")
         logger.info("Done.")
     finally:
-        await client.close()
+        try:
+            _save_token(client.coulomb_token or "")
+        finally:
+            await client.close()
 
 
 if __name__ == "__main__":
