@@ -20,8 +20,8 @@ from firebase_admin import credentials, db
 
 from python_chargepoint import ChargePoint
 from python_chargepoint.exceptions import (
-    CommunicationError,
     DatadomeCaptcha,
+    InvalidSession,
     LoginError,
 )
 
@@ -433,22 +433,30 @@ def _save_token(token: str) -> None:
 
 async def get_client(username: str, password: str, session_token: str) -> ChargePoint:
     """
-    Prefer a coulomb_sess token (env override, else the last one this poller
-    saved) so we never hit the Datadome-protected password login endpoint.
+    Prefer the last coulomb_sess token this poller saved, using the environment
+    token only to bootstrap or recover from an expired saved token.
     ChargePoint reissues coulomb_sess with a fresh ~2hr Max-Age on every
     authenticated response, so as long as this poller keeps running on an
     interval shorter than that, persisting the rotated token keeps the
     session alive indefinitely without ever needing to re-login.
     """
-    token = session_token or _load_saved_token()
-    if token:
+    token_candidates: List[Tuple[str, str]] = []
+    for source, token in (
+        ("saved", _load_saved_token()),
+        ("configured", session_token),
+    ):
+        if token and all(token != candidate for _, candidate in token_candidates):
+            token_candidates.append((source, token))
+
+    for source, token in token_candidates:
         try:
             client = await ChargePoint.create(username=username, coulomb_token=token)
-            logger.info("Logged in to ChargePoint using saved session token.")
+            logger.info("Logged in to ChargePoint using %s session token.", source)
             return client
-        except (CommunicationError, DatadomeCaptcha) as exc:
+        except InvalidSession as exc:
             logger.warning(
-                "Saved session token was rejected (%s); falling back to password login.",
+                "%s session token was rejected (%s).",
+                source.capitalize(),
                 exc,
             )
 
