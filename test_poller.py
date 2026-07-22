@@ -40,7 +40,7 @@ class GetClientTests(unittest.IsolatedAsyncioTestCase):
                 patch(
                     "poller.ChargePoint.create",
                     new_callable=AsyncMock,
-                    side_effect=[CommunicationError("expired"), client],
+                    side_effect=[CommunicationError(None, "expired"), client],
                 ) as create,
             ):
                 result = await poller.get_client(
