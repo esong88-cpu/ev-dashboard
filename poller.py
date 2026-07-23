@@ -433,22 +433,32 @@ def _save_token(token: str) -> None:
 
 async def get_client(username: str, password: str, session_token: str) -> ChargePoint:
     """
-    Prefer a coulomb_sess token (env override, else the last one this poller
-    saved) so we never hit the Datadome-protected password login endpoint.
+    Prefer the last coulomb_sess token this poller saved, with the environment
+    token as a bootstrap fallback, so we avoid the Datadome-protected password
+    login endpoint.
     ChargePoint reissues coulomb_sess with a fresh ~2hr Max-Age on every
     authenticated response, so as long as this poller keeps running on an
     interval shorter than that, persisting the rotated token keeps the
     session alive indefinitely without ever needing to re-login.
     """
-    token = session_token or _load_saved_token()
-    if token:
+    saved_token = _load_saved_token()
+    token_candidates: List[Tuple[str, str]] = []
+    if saved_token:
+        token_candidates.append(("persisted", saved_token))
+    if session_token and session_token != saved_token:
+        token_candidates.append(("bootstrap", session_token))
+
+    for token_source, token in token_candidates:
         try:
             client = await ChargePoint.create(username=username, coulomb_token=token)
-            logger.info("Logged in to ChargePoint using saved session token.")
+            logger.info(
+                "Logged in to ChargePoint using the %s session token.", token_source
+            )
             return client
         except (CommunicationError, DatadomeCaptcha) as exc:
             logger.warning(
-                "Saved session token was rejected (%s); falling back to password login.",
+                "%s session token was rejected (%s); trying the next authentication method.",
+                token_source.capitalize(),
                 exc,
             )
 
@@ -552,10 +562,14 @@ async def main() -> None:
             last_updated,
             json.dumps(payload, default=str)[:500],
         )
-        _save_token(client.coulomb_token or "")
         logger.info("Done.")
     finally:
-        await client.close()
+        try:
+            # Authenticated responses rotate coulomb_sess. Persist the latest
+            # value even when a downstream Firebase operation fails.
+            _save_token(client.coulomb_token or "")
+        finally:
+            await client.close()
 
 
 if __name__ == "__main__":
