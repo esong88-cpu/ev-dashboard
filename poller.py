@@ -10,10 +10,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 import firebase_admin
 from firebase_admin import credentials, db
@@ -49,47 +50,62 @@ def _parse_station_ids(raw: str) -> List[int]:
     return ids
 
 
+def _status_tokens(status: str, status_v2: str) -> Set[str]:
+    """Split ChargePoint status strings into alphanumeric tokens."""
+    raw = f"{status_v2 or ''} {status or ''}".strip().lower()
+    return set(re.findall(r"[a-z0-9]+", raw))
+
+
 def _normalize_port_status(status: str, status_v2: str) -> str:
     """
-    Map ChargePoint API strings to: Available | Charging | Complete.
+    Map ChargePoint API strings to: Available | Charging | Complete | Unavailable.
     Unknown values are passed through in Title Case for visibility.
+
+    Matching is token-based so substrings cannot false-positive: e.g.
+    "unavailable" must not match "available", and "not_charging" must not
+    match "charg"/"charging".
     """
-    s = f"{status_v2 or ''} {status or ''}".strip().lower()
-    if not s:
+    tokens = _status_tokens(status, status_v2)
+    if not tokens:
         return "Unknown"
 
-    if any(
-        k in s
-        for k in (
-            "finish",
-            "complete",
-            "done",
-            "fully_charged",
-            "stopped",
-        )
-    ):
+    if {"fully", "charged"} <= tokens or tokens & {
+        "finish",
+        "finished",
+        "complete",
+        "completed",
+        "done",
+        "stopped",
+    }:
         return "Complete"
 
-    if any(
-        k in s
-        for k in (
-            "charg",
-            "in_use",
-            "inuse",
+    if tokens & {"fault", "offline", "unavailable"} or tokens == {"unknown"}:
+        return "Unavailable"
+
+    # "not charging" is idle on the public mapcache path; home chargers handle
+    # plugged-in NOT_CHARGING separately via is_plugged_in.
+    if "not" in tokens and "charging" in tokens:
+        return "Available"
+
+    if (
+        tokens & {
+            "charging",
             "occupied",
-            "prepar",
+            "inuse",
+            "preparing",
+            "prepare",
+            "prepared",
+            "suspended",
             "suspend",
             "session",
             "active",
-        )
+        }
+        or {"in", "use"} <= tokens
     ):
         return "Charging"
 
-    if any(k in s for k in ("available", "free", "idle", "ready")):
+    if tokens & {"available", "free", "idle", "ready"}:
         return "Available"
-
-    if any(k in s for k in ("fault", "offline", "unavailable", "unknown")):
-        return "Unavailable"
 
     return (status_v2 or status or "Unknown").replace("_", " ").title()
 
@@ -327,14 +343,19 @@ async def fetch_home_charger_status(
     """Home Flex / Panda status — single logical port from charging_status."""
     hs = await client.get_home_charger_status(device_id)
     raw = hs.charging_status.upper()
+    plugged_in = bool(getattr(hs, "is_plugged_in", False))
     if raw == "AVAILABLE":
         label = "Available"
     elif raw == "CHARGING":
         label = "Charging"
     elif raw == "NOT_CHARGING":
-        label = "Available"
+        # Finished / scheduled-off but still plugged in must stay occupied so
+        # the co-op "move the car" timer and metadata are not wiped.
+        label = "Complete" if plugged_in else "Available"
     else:
         label = _normalize_port_status(raw, "")
+        if label == "Available" and plugged_in:
+            label = "Complete"
     name_parts = [hs.brand or "", hs.model or ""]
     name = " ".join(x for x in name_parts if x).strip() or f"HomeCharger-{device_id}"
     return {
