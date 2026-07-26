@@ -207,6 +207,27 @@
 
         const META_KEYS = new Set(["last_updated", "charging_limit_minutes"]);
 
+        /**
+         * Firebase RTDB may return list-valued nodes for numeric-looking keys
+         * (e.g. ports {"1","2"} → [null, "Charging", "Available"]). Normalize to
+         * a string-keyed object and drop null holes so ghost index "0" rows cannot
+         * displace real stalls in the parking lot.
+         */
+        function recordMap(obj) {
+            if (!obj || typeof obj !== "object") return {};
+            if (Array.isArray(obj)) {
+                return obj.reduce((acc, v, i) => {
+                    if (v !== null && v !== undefined) acc[String(i)] = v;
+                    return acc;
+                }, {});
+            }
+            const out = {};
+            for (const [k, v] of Object.entries(obj)) {
+                if (v !== null && v !== undefined) out[String(k)] = v;
+            }
+            return out;
+        }
+
         /** Rows in stable order (device id, port) — no status sort (for fixed parking stalls). */
         function flattenPortsStable(stations) {
             const rows = [];
@@ -215,10 +236,9 @@
                 if (!entry || typeof entry !== "object") continue;
                 if (entry.error) continue;
                 const title = stationTitle(entry);
-                const ports = entry.ports && typeof entry.ports === "object" ? entry.ports : {};
+                const ports = recordMap(entry.ports);
                 const keys = Object.keys(ports).sort((a, b) => Number(a) - Number(b));
-                const portSessions =
-                    entry.port_sessions && typeof entry.port_sessions === "object" ? entry.port_sessions : {};
+                const portSessions = recordMap(entry.port_sessions);
                 if (keys.length === 0) {
                     rows.push({
                         key: `${id}-0`,
