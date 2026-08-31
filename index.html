@@ -302,14 +302,15 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
+                const rawResetMs =
                     reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
                         ? reset.at_ms
                         : NaN;
+                const resetMs = Number.isFinite(rawResetMs) ? Math.min(rawResetMs, now) : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
                     Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
+                        ? new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
