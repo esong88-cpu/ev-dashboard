@@ -160,6 +160,8 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const METADATA_MAX_FUTURE_MS = 24 * 60 * 60 * 1000;
+        const RESET_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -280,7 +282,14 @@
             if (!Number.isFinite(start)) return null;
             const base = start + limitMin * 60 * 1000;
             const ext = extMap[row.key];
-            if (ext && typeof ext.until_ms === "number" && Number.isFinite(ext.until_ms)) return ext.until_ms;
+            if (
+                ext &&
+                typeof ext.until_ms === "number" &&
+                Number.isFinite(ext.until_ms) &&
+                ext.until_ms <= Date.now() + METADATA_MAX_FUTURE_MS
+            ) {
+                return Math.max(base, ext.until_ms);
+            }
             return base;
         }
 
@@ -308,7 +317,9 @@
                         : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
                 const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
+                    Number.isFinite(resetMs) &&
+                    resetMs <= now + RESET_MAX_FUTURE_SKEW_MS &&
+                    (!Number.isFinite(startMs) || resetMs > startMs)
                         ? reset.at || new Date(resetMs).toISOString()
                         : r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
@@ -704,7 +715,13 @@
             }
             const base = start + row.limitMin * 60 * 1000;
             const prev = (lastExtMap || {})[row.key] || {};
-            const anchor = typeof prev.until_ms === "number" && prev.until_ms > 0 ? prev.until_ms : base;
+            const prevUntil =
+                typeof prev.until_ms === "number" &&
+                prev.until_ms > 0 &&
+                prev.until_ms <= Date.now() + METADATA_MAX_FUTURE_MS
+                    ? prev.until_ms
+                    : base;
+            const anchor = Math.max(base, prevUntil);
             const newUntil = Math.max(anchor, Date.now()) + extra * 60 * 1000;
             try {
                 await set(ref(db, `slot_extensions/${row.key}`), {

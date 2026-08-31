@@ -39,6 +39,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+METADATA_MAX_FUTURE_MS = 24 * 60 * 60 * 1000
+RESET_MAX_FUTURE_SKEW_MS = 5 * 60 * 1000
+
 
 def _parse_station_ids(raw: str) -> List[int]:
     ids: List[int] = []
@@ -165,6 +168,7 @@ def enrich_stations_with_port_sessions(
         if k not in ("last_updated", "charging_limit_minutes") and isinstance(v, dict)
     }
     now_iso = datetime.now(timezone.utc).isoformat()
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     ext_clear: List[str] = []
 
     for sid, entry in list(stations.items()):
@@ -202,7 +206,11 @@ def enrich_stations_with_port_sessions(
             if isinstance(reset, dict):
                 reset_ms = reset.get("at_ms")
                 reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
+                if (
+                    isinstance(reset_ms, (int, float))
+                    and reset_ms > _iso_to_utc_ms(started_at)
+                    and reset_ms <= now_ms + RESET_MAX_FUTURE_SKEW_MS
+                ):
                     started_at = reset_iso or datetime.fromtimestamp(
                         reset_ms / 1000, tz=timezone.utc
                     ).isoformat()
@@ -242,8 +250,13 @@ def _policy_deadline_ms(
     ext = ext_map.get(slot_key) if isinstance(ext_map, dict) else None
     if isinstance(ext, dict):
         um = ext.get("until_ms")
-        if isinstance(um, (int, float)) and um > 0:
-            return int(um)
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if (
+            isinstance(um, (int, float))
+            and um > 0
+            and um <= now_ms + METADATA_MAX_FUTURE_MS
+        ):
+            return max(base, int(um))
     return base
 
 
