@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -38,6 +39,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S%z",
 )
 logger = logging.getLogger(__name__)
+
+RESET_FUTURE_SKEW_MS = 10 * 60 * 1000
 
 
 def _parse_station_ids(raw: str) -> List[int]:
@@ -151,6 +154,32 @@ def _session_occupancy_bucket(label: str) -> str:
     return "occupied"
 
 
+def _finite_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def _reset_started_at_from_metadata(
+    reset: Any, current_started_at: str, now_ms: int | None = None
+) -> str | None:
+    if not isinstance(reset, dict):
+        return None
+
+    reset_ms = reset.get("at_ms")
+    if not _finite_number(reset_ms):
+        return None
+
+    reset_ms_int = int(reset_ms)
+    if reset_ms_int <= _iso_to_utc_ms(current_started_at):
+        return None
+
+    if now_ms is None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if reset_ms_int > now_ms + RESET_FUTURE_SKEW_MS:
+        return None
+
+    return datetime.fromtimestamp(reset_ms_int / 1000, tz=timezone.utc).isoformat()
+
+
 def enrich_stations_with_port_sessions(
     prev_root: Dict[str, Any], stations: Dict[str, Any], reset_map: Dict[str, Any]
 ) -> List[str]:
@@ -199,13 +228,9 @@ def enrich_stations_with_port_sessions(
                 started_at = old_start
 
             reset = reset_map.get(f"{sid}-{pk_s}") if isinstance(reset_map, dict) else None
-            if isinstance(reset, dict):
-                reset_ms = reset.get("at_ms")
-                reset_iso = str(reset.get("at") or "")
-                if isinstance(reset_ms, (int, float)) and reset_ms > _iso_to_utc_ms(started_at):
-                    started_at = reset_iso or datetime.fromtimestamp(
-                        reset_ms / 1000, tz=timezone.utc
-                    ).isoformat()
+            reset_started_at = _reset_started_at_from_metadata(reset, started_at)
+            if reset_started_at is not None:
+                started_at = reset_started_at
 
             new_sess[pk_s] = {"started_at": started_at}
 

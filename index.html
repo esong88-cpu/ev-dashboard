@@ -160,6 +160,7 @@
 
         const completeSince = new Map();
         const STALL_COUNT = 4;
+        const RESET_FUTURE_SKEW_MS = 10 * 60 * 1000;
 
         let lastStationPayload = null;
         let lastExtMap = {};
@@ -275,6 +276,18 @@
             return NaN;
         }
 
+        function resetStartedAtFromMetadata(reset, currentStartMs, now) {
+            if (!reset || typeof reset !== "object") return null;
+            const resetMs = reset.at_ms;
+            if (typeof resetMs !== "number" || !Number.isFinite(resetMs)) return null;
+            if (Number.isFinite(currentStartMs) && resetMs <= currentStartMs) return null;
+            if (resetMs > now + RESET_FUTURE_SKEW_MS) return null;
+
+            const resetDate = new Date(resetMs);
+            if (!Number.isFinite(resetDate.getTime())) return null;
+            return resetDate.toISOString();
+        }
+
         function policyDeadlineMs(row, limitMin, extMap) {
             const start = parseIsoToMs(row.sessionStartedAt);
             if (!Number.isFinite(start)) return null;
@@ -302,15 +315,9 @@
             return stable.map((r) => {
                 const cpBucket = statusBucket(r.status);
                 const reset = resetMap && typeof resetMap === "object" ? resetMap[r.key] : null;
-                const resetMs =
-                    reset && typeof reset.at_ms === "number" && Number.isFinite(reset.at_ms)
-                        ? reset.at_ms
-                        : NaN;
                 const startMs = parseIsoToMs(r.sessionStartedAt);
-                const sessionStartedAt =
-                    Number.isFinite(resetMs) && (!Number.isFinite(startMs) || resetMs > startMs)
-                        ? reset.at || new Date(resetMs).toISOString()
-                        : r.sessionStartedAt;
+                const resetStartedAt = resetStartedAtFromMetadata(reset, startMs, now);
+                const sessionStartedAt = resetStartedAt || r.sessionStartedAt;
                 const row = { ...r, sessionStartedAt };
                 return {
                     ...row,
